@@ -244,6 +244,9 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
+        # mempalace_room_read is deliberately absent: it writes only the
+        # reader's own read position, bookkeeping rather than palace state,
+        # so a read-only client can still follow a room.
         "mempalace_room_open",
         "mempalace_room_say",
         "mempalace_room_close",

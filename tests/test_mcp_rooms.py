@@ -133,6 +133,13 @@ class TestCloseFiling:
         # classifies these drawers as having no source rather than a file.
         assert not any("source_dir_ino" in m for m in got["metadatas"])
 
+        # The room id is the one-call handle for recalling the discussion.
+        found = _call(
+            "mempalace_search", {"query": "Decision keep it", "source_file": room_id, "limit": 10}
+        )
+        assert found.get("results"), found
+        assert all(r["source_path"] == room_id for r in found["results"])
+
         retry = _call("mempalace_room_close", {"room_id": room_id, "from_agent": "operator"})
         assert retry["success"] is True
         assert retry["already_closed"] is True

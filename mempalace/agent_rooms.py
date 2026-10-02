@@ -36,9 +36,12 @@ def room_slug(name: str) -> str:
 
 def room_handoff(room_id: str) -> str:
     """The one line an operator pastes into an agent's chat to bring it in."""
+    # Names both server shapes: the line is pasted into chats the opener
+    # cannot see, some on the full server and some on the light one.
     return (
-        f"Join MemPalace room {room_id}: read it with mempalace_room_read as your agent "
-        "identity, then post with mempalace_room_say only if you add something new."
+        f"Join MemPalace room {room_id}: read it as your agent identity "
+        "(mempalace_room_read, or palace_coordinate ROOM READ), then post "
+        "(mempalace_room_say, or ROOM SAY) only if you add something new."
     )
 
 
