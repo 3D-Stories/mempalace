@@ -70,8 +70,10 @@ lock. The position moves to the last event returned, never past one the
 reader was not shown. `more` tells the reader the page was full.
 
 - The first read returns everything, the reader's own turns included, so a
-  fresh session sees its earlier words. Later reads leave the reader's own
-  turns out: it wrote them.
+  fresh session sees its earlier words. That holds across pages: the first
+  read records the newest event in the room, and the reader's own turns up
+  to that mark are returned however many reads the catch-up takes. After
+  it, the reader's own turns are left out: it wrote them.
 - `say` returns `unread`, the number of messages from others since the
   speaker's last read, so an agent knows when the room moved while it was
   composing.
@@ -115,10 +117,26 @@ Nothing is spawned, and no window opens.
 
 ### Closing files the transcript
 
-`room_close` appends `room.close` first, then files every event up to and
-including it. If it filed first, a message landing between filing and close
-would be lost. Each body-bearing turn (agenda, messages, outcome) becomes
-one drawer:
+`room_close` appends `room.close` first, then files the transcript. If it
+filed first, a message landing between filing and close would be lost.
+
+Two guards keep "the transcript" well defined:
+
+- **Nothing is accepted after a close.** `say` and `close` append with
+  `unless_correlation_has=room.close`: the check for a close and the insert
+  are one `BEGIN IMMEDIATE` transaction. A message that saw the room open
+  but lost the race to a close is refused rather than stored outside the
+  transcript. A second close reports `already_closed` rather than appending.
+- **The boundary is the close's HLC, not its local arrival order.** The
+  transcript is every room event whose HLC is at or before the close's.
+  HLC is the same on every replica, so a turn written before the close on
+  another replica belongs to the transcript even when it arrives here after
+  the close, and closing again files it. A turn whose HLC is after the
+  close stays in the logstream, verbatim, but outside the filed transcript.
+  If replicas each recorded a close, the one with the earliest HLC is the
+  room's close everywhere.
+
+Each body-bearing turn (agenda, messages, outcome) becomes one drawer:
 
 - `wing` = the project slug, palace `room` = the room name. A discussion
   room files into the palace room of the same name.
@@ -133,6 +151,11 @@ one drawer:
 
   Drawer ids derive from content, so the event id in the locator keeps two
   identical turns as two drawers.
+
+A drawer holds at most 100,000 characters, while the logstream accepts
+bodies up to 256 KiB. A turn that could not be filed would fail every close,
+so open, say and close refuse a body over the drawer limit minus room for
+the locator line (`MAX_ROOM_BODY_CHARS`).
 
 Filing can fail, for example when the vector index is unavailable. In that
 case close reports the error and leaves the room closed. Calling close again

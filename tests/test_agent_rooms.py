@@ -26,6 +26,45 @@ def _bodies(result):
     return [e["body"] for e in result["events"]]
 
 
+def _remote(room_id, body, ms, origin_seq=1, type="room.message"):
+    """A room event as another replica would ship it, authored at ``ms``."""
+    return {
+        "id": f"evt_remote_{origin_seq:06d}_{ms}",
+        "type": type,
+        "stream": "project/mempalace",
+        "room": ar.ROOMS_LOGSTREAM_ROOM,
+        "from_agent": "b",
+        "to_agent": "*",
+        "correlation_id": room_id,
+        "body": body,
+        "created_at": "2026-01-01T00:00:00Z",
+        "origin_replica": "replica-b",
+        "origin_seq": origin_seq,
+        "hlc": f"{ms:013d}-000000-replica-b",
+    }
+
+
+class TestGuardedAppend:
+    def test_append_refused_when_correlation_already_has_the_type(self, ls):
+        from mempalace.logstream import EventConflict
+
+        args = dict(stream="s/x", room="r", from_agent="a", correlation_id="c1")
+        ls.append_event(type="x.stop", **args)
+        with pytest.raises(EventConflict, match="already has x.stop"):
+            ls.append_event(type="x.go", unless_correlation_has="x.stop", **args)
+        assert ls.list_events(correlation_id="c1", type="x.go") == []
+        # Another correlation is unaffected.
+        ls.append_event(
+            type="x.go", unless_correlation_has="x.stop", **{**args, "correlation_id": "c2"}
+        )
+
+    def test_guard_needs_a_correlation(self, ls):
+        with pytest.raises(ValueError, match="needs a correlation_id"):
+            ls.append_event(
+                type="x.go", stream="s", room="r", from_agent="a", unless_correlation_has="x.stop"
+            )
+
+
 class TestNames:
     def test_room_slug_is_kebab_case(self):
         assert ar.room_slug("Search Brainstorm!") == "search-brainstorm"
@@ -139,25 +178,37 @@ class TestRead:
         but applied here after a read is still ahead of the reader's position."""
         room_id = _open(ls)
         ar.read_room(ls, room_id=room_id, agent="a")
-        ls.apply_remote_event(
-            {
-                "id": "evt_20260101T000000_remote000001",
-                "type": "room.message",
-                "stream": "project/mempalace",
-                "room": ar.ROOMS_LOGSTREAM_ROOM,
-                "from_agent": "b",
-                "to_agent": "*",
-                "correlation_id": room_id,
-                "body": "authored long ago on another replica",
-                "created_at": "2026-01-01T00:00:00Z",
-                "origin_replica": "replica-b",
-                "origin_seq": 1,
-                "hlc": "0000000000001-000000-replica-b",
-            }
-        )
+        ls.apply_remote_event(_remote(room_id, "authored long ago on another replica", 1))
         assert _bodies(ar.read_room(ls, room_id=room_id, agent="a")) == [
             "authored long ago on another replica"
         ]
+
+    def test_paged_first_read_still_returns_your_older_messages(self, ls):
+        """Only the first page is a 'first read' call; the reader's own older
+        messages on later pages are still part of that initial catch-up."""
+        room_id = _open(ls)
+        for i in range(3):
+            ar.say_in_room(ls, room_id=room_id, from_agent="b", body=f"b{i}")
+            ar.say_in_room(ls, room_id=room_id, from_agent="a", body=f"a{i}")
+        seen = []
+        while True:
+            page = ar.read_room(ls, room_id=room_id, agent="a", limit=2)
+            seen += _bodies(page)
+            if not page["more"]:
+                break
+        assert seen == [
+            "Should BM25 move into the Rust engine?",
+            "b0",
+            "a0",
+            "b1",
+            "a1",
+            "b2",
+            "a2",
+        ]
+        # After the catch-up, the reader's new messages are left out again.
+        ar.say_in_room(ls, room_id=room_id, from_agent="a", body="new mine")
+        ar.say_in_room(ls, room_id=room_id, from_agent="b", body="new theirs")
+        assert _bodies(ar.read_room(ls, room_id=room_id, agent="a")) == ["new theirs"]
 
     def test_positions_are_not_replicated(self, ls):
         """A position is a local rowid; it must never travel as an op."""
@@ -193,6 +244,56 @@ class TestSay:
         with pytest.raises(ValueError, match="closed"):
             ar.say_in_room(ls, room_id=room_id, from_agent="a", body="too late")
 
+    def test_close_landing_after_the_check_still_refuses_the_message(self, ls, monkeypatch):
+        """The closed check and the append are one transaction: a message that
+        read the room as open is refused if a close got in first, so no
+        accepted turn ever sits outside the transcript."""
+        room_id = _open(ls)
+        stale = ar.get_room(ls, room_id)
+        ar.close_room(ls, room_id=room_id, from_agent="operator")
+        monkeypatch.setattr(ar, "get_room", lambda _ls, _rid: dict(stale))
+        with pytest.raises(ValueError, match="closed"):
+            ar.say_in_room(ls, room_id=room_id, from_agent="a", body="raced")
+        assert ls.list_events(correlation_id=room_id, type=ar.ROOM_MESSAGE) == []
+
+    def test_turn_too_large_to_file_is_refused(self, ls):
+        room_id = _open(ls)
+        with pytest.raises(ValueError, match="filed as one drawer"):
+            ar.say_in_room(
+                ls, room_id=room_id, from_agent="a", body="x" * (ar.MAX_ROOM_BODY_CHARS + 1)
+            )
+        with pytest.raises(ValueError, match="filed as one drawer"):
+            ar.open_room(
+                ls,
+                project="p",
+                from_agent="o",
+                name="n",
+                agenda="x" * (ar.MAX_ROOM_BODY_CHARS + 1),
+            )
+        with pytest.raises(ValueError, match="filed as one drawer"):
+            ar.close_room(
+                ls, room_id=room_id, from_agent="o", outcome="x" * (ar.MAX_ROOM_BODY_CHARS + 1)
+            )
+        assert ar.get_room(ls, room_id)["closed"] is False
+
+    def test_largest_turn_still_fits_one_drawer(self, ls):
+        """The worst-case locator (routing fields at their maximum length)
+        plus the largest accepted body passes the drawer content check."""
+        from mempalace.config import sanitize_content
+
+        long_agent = "a" * 256
+        room_id = _open(ls)
+        ar.say_in_room(
+            ls,
+            room_id=room_id,
+            from_agent=long_agent,
+            to_agent="b" * 256,
+            body="x" * ar.MAX_ROOM_BODY_CHARS,
+        )
+        closed = ar.close_room(ls, room_id=room_id, from_agent="o")
+        for drawer in ar.transcript_drawers(closed["transcript"]):
+            sanitize_content(drawer)
+
 
 class TestClose:
     def test_close_appends_once_and_returns_the_transcript(self, ls):
@@ -227,8 +328,46 @@ class TestClose:
             correlation_id=room_id,
             body="after",
         )
-        transcript = ar.room_transcript(ls, room_id, close["transcript"][-1]["seq"])
+        transcript = ar.room_transcript(ls, room_id, close["transcript"][-1]["hlc"])
         assert "after" not in [e["body"] for e in transcript]
+
+    def test_concurrent_close_does_not_close_twice(self, ls, monkeypatch):
+        """A close that read the room as open before another close landed
+        reports already-closed instead of appending a second close."""
+        room_id = _open(ls)
+        stale = ar.get_room(ls, room_id)
+        first = ar.close_room(ls, room_id=room_id, from_agent="operator", outcome="first")
+        monkeypatch.setattr(ar, "get_room", lambda _ls, _rid: dict(stale))
+        second = ar.close_room(ls, room_id=room_id, from_agent="other", outcome="second")
+        assert second["already_closed"] is True
+        assert second["event"]["id"] == first["event"]["id"]
+        assert len(ls.list_events(correlation_id=room_id, type=ar.ROOM_CLOSE)) == 1
+
+    def test_late_replicated_turn_from_before_the_close_is_filed_on_retry(self, ls):
+        """The boundary is the close's HLC, which every replica shares; a turn
+        authored before the close elsewhere arrives here after it (a newer
+        local rowid) and still belongs to the transcript."""
+        room_id = _open(ls)
+        first = ar.close_room(ls, room_id=room_id, from_agent="operator", outcome="done")
+        close_hlc = first["transcript"][-1]["hlc"]
+        ms = int(close_hlc.split("-")[0])
+        ls.apply_remote_event(_remote(room_id, "before the close", ms - 1, origin_seq=1))
+        ls.apply_remote_event(_remote(room_id, "after the close", ms + 1, origin_seq=2))
+
+        again = ar.close_room(ls, room_id=room_id, from_agent="operator")
+        bodies = [e["body"] for e in again["transcript"]]
+        assert "before the close" in bodies
+        assert "after the close" not in bodies
+        assert again["transcript"][-1]["type"] == ar.ROOM_CLOSE
+
+    def test_earliest_close_by_hlc_wins_across_replicas(self, ls):
+        room_id = _open(ls)
+        local = ar.close_room(ls, room_id=room_id, from_agent="operator", outcome="here")
+        ms = int(local["transcript"][-1]["hlc"].split("-")[0])
+        earlier = _remote(room_id, "there", ms - 1, origin_seq=1, type=ar.ROOM_CLOSE)
+        ls.apply_remote_event(earlier)
+        room = ar.get_room(ls, room_id)
+        assert room["close_event_id"] == earlier["id"]
 
     def test_transcript_pages_past_one_list_page(self, ls, monkeypatch):
         monkeypatch.setattr(ar, "_TRANSCRIPT_PAGE", 2)

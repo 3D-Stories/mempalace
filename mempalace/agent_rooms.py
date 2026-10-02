@@ -11,9 +11,12 @@ on purpose when a room closes: its transcript is filed into the palace room
 of the same name.
 """
 
+import inspect
 import re
 import secrets
 
+from .config import sanitize_content
+from .logstream import EventConflict
 from .tasks import task_slug
 
 ROOMS_LOGSTREAM_ROOM = "rooms"
@@ -24,6 +27,14 @@ ROOM_CLOSE = "room.close"
 TRANSCRIPT_TYPES = (ROOM_OPEN, ROOM_MESSAGE, ROOM_CLOSE)
 
 _TRANSCRIPT_PAGE = 500
+
+# Every turn is filed as one drawer on close, and a drawer holds at most
+# ``sanitize_content``'s limit. A turn that cannot be filed must be refused
+# when it is posted: once stored, it would fail every close. The margin
+# covers the locator line (two routing fields of up to 256 characters each,
+# the event id, the type and the timestamp).
+_DRAWER_CONTENT_LIMIT = inspect.signature(sanitize_content).parameters["max_length"].default
+MAX_ROOM_BODY_CHARS = _DRAWER_CONTENT_LIMIT - 1_000
 
 
 def room_slug(name: str) -> str:
@@ -51,6 +62,28 @@ def _check_room_id(room_id) -> str:
     return room_id.strip()
 
 
+def _check_body(body, what: str, required: bool) -> str:
+    if body is None:
+        body = ""
+    if not isinstance(body, str):
+        raise ValueError(f"room {what} must be a string")
+    if required and not body.strip():
+        raise ValueError(f"room {what} must not be empty")
+    if len(body) > MAX_ROOM_BODY_CHARS:
+        raise ValueError(
+            f"room {what} is {len(body)} characters; a room turn holds at most "
+            f"{MAX_ROOM_BODY_CHARS} so it can be filed as one drawer"
+        )
+    return body
+
+
+def _canonical_close(logstream, room_id: str):
+    """The room's close, or None. With replicas, two closes can exist; the
+    earliest by HLC is the one every replica agrees on."""
+    closes = logstream.list_events(correlation_id=room_id, type=ROOM_CLOSE, limit=500)
+    return min(closes, key=lambda e: e["hlc"]) if closes else None
+
+
 def _compact(event: dict) -> dict:
     """The fields a participant needs; routing noise stays in the logstream."""
     return {
@@ -70,7 +103,7 @@ def get_room(logstream, room_id: str) -> dict:
     if not opened:
         raise ValueError(f"room {room_id!r} not found")
     open_event = opened[0]
-    closed = logstream.list_events(correlation_id=room_id, type=ROOM_CLOSE, limit=1, order="asc")
+    close = _canonical_close(logstream, room_id)
     meta = open_event["metadata"]
     room = {
         "room_id": room_id,
@@ -81,12 +114,12 @@ def get_room(logstream, room_id: str) -> dict:
         "opened_by": open_event["from_agent"],
         "opened_at": open_event["created_at"],
         "agenda": open_event["body"],
-        "closed": bool(closed),
+        "closed": close is not None,
     }
-    if closed:
-        room["closed_by"] = closed[0]["from_agent"]
-        room["closed_at"] = closed[0]["created_at"]
-        room["close_event_id"] = closed[0]["id"]
+    if close is not None:
+        room["closed_by"] = close["from_agent"]
+        room["closed_at"] = close["created_at"]
+        room["close_event_id"] = close["id"]
     return room
 
 
@@ -95,6 +128,7 @@ def open_room(logstream, *, project: str, from_agent: str, name: str, agenda: st
     if not isinstance(project, str) or not project.strip():
         raise ValueError("room project must not be empty")
     slug = room_slug(name)
+    agenda = _check_body(agenda, "agenda", required=False)
     project_slug = task_slug(project, fallback="project")
     room_id = f"room_{slug}_{secrets.token_hex(4)}"
     event = logstream.append_event(
@@ -129,20 +163,25 @@ def say_in_room(
     logstream, *, room_id: str, from_agent: str, body: str, to_agent: str = None
 ) -> dict:
     """Post one message; reports how much from others the speaker has not read."""
+    body = _check_body(body, "message body", required=True)
     room = get_room(logstream, room_id)
+    closed = ValueError(f"room {room['room_id']!r} is closed")
     if room["closed"]:
-        raise ValueError(f"room {room['room_id']!r} is closed")
-    if not isinstance(body, str) or not body.strip():
-        raise ValueError("room message body must not be empty")
-    event = logstream.append_event(
-        type=ROOM_MESSAGE,
-        stream=room["stream"],
-        room=ROOMS_LOGSTREAM_ROOM,
-        from_agent=from_agent,
-        to_agent=to_agent or "*",
-        correlation_id=room["room_id"],
-        body=body,
-    )
+        raise closed
+    try:
+        # Guarded: a close that lands after the check above still wins.
+        event = logstream.append_event(
+            type=ROOM_MESSAGE,
+            stream=room["stream"],
+            room=ROOMS_LOGSTREAM_ROOM,
+            from_agent=from_agent,
+            to_agent=to_agent or "*",
+            correlation_id=room["room_id"],
+            body=body,
+            unless_correlation_has=ROOM_CLOSE,
+        )
+    except EventConflict:
+        raise closed from None
     return {
         "event": _compact(event),
         "unread": logstream.unread_count(room["room_id"], event["from_agent"]),
@@ -152,36 +191,45 @@ def say_in_room(
 def close_room(logstream, *, room_id: str, from_agent: str, outcome: str = "") -> dict:
     """Close a room (once) and return everything up to the close, in order.
 
-    Closing a closed room appends nothing and returns the same transcript,
-    so a caller whose filing failed can simply close again.
+    Closing a closed room appends nothing and returns the transcript again,
+    so a caller whose filing failed can simply close again. So does a close
+    that loses a race with another one.
     """
+    outcome = _check_body(outcome, "outcome", required=False)
     room = get_room(logstream, room_id)
     already_closed = room["closed"]
-    if already_closed:
-        close_event = logstream.list_events(
-            correlation_id=room["room_id"], type=ROOM_CLOSE, limit=1, order="asc"
-        )[0]
-    else:
-        close_event = logstream.append_event(
-            type=ROOM_CLOSE,
-            stream=room["stream"],
-            room=ROOMS_LOGSTREAM_ROOM,
-            from_agent=from_agent,
-            to_agent="*",
-            correlation_id=room["room_id"],
-            body=outcome,
-        )
-        room = get_room(logstream, room["room_id"])
+    if not already_closed:
+        try:
+            logstream.append_event(
+                type=ROOM_CLOSE,
+                stream=room["stream"],
+                room=ROOMS_LOGSTREAM_ROOM,
+                from_agent=from_agent,
+                to_agent="*",
+                correlation_id=room["room_id"],
+                body=outcome,
+                unless_correlation_has=ROOM_CLOSE,
+            )
+        except EventConflict:
+            already_closed = True
+    close_event = _canonical_close(logstream, room["room_id"])
+    room = get_room(logstream, room["room_id"])
     return {
         "room": room,
         "event": _compact(close_event),
         "already_closed": already_closed,
-        "transcript": room_transcript(logstream, room["room_id"], close_event["seq"]),
+        "transcript": room_transcript(logstream, room["room_id"], close_event["hlc"]),
     }
 
 
-def room_transcript(logstream, room_id: str, upto_seq: int) -> list:
-    """Every event in the room up to and including ``upto_seq``, oldest first."""
+def room_transcript(logstream, room_id: str, upto_hlc: str) -> list:
+    """Every event in the room at or before ``upto_hlc``, in HLC order.
+
+    The boundary is the close's HLC, not its local arrival order: HLC is the
+    same on every replica, so a turn written before the close on another
+    replica belongs to the transcript even when it arrives here after the
+    close, and closing again files it.
+    """
     events = []
     cursor = None
     while True:
@@ -191,9 +239,9 @@ def room_transcript(logstream, room_id: str, upto_seq: int) -> list:
             limit=_TRANSCRIPT_PAGE,
             order="asc",
         )
-        events.extend(e for e in page if e["seq"] <= upto_seq)
-        if len(page) < _TRANSCRIPT_PAGE or page[-1]["seq"] >= upto_seq:
-            return events
+        events.extend(e for e in page if e["hlc"] <= upto_hlc)
+        if len(page) < _TRANSCRIPT_PAGE:
+            return sorted(events, key=lambda e: e["hlc"])
         cursor = page[-1]["id"]
 
 

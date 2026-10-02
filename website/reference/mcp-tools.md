@@ -718,10 +718,10 @@ correlation per room.
 
 Everything in a room the reader has not read yet, oldest first. The hub keeps
 each reader's place, so there is no cursor to pass. The first read returns the
-whole room; later reads leave out the reader's own messages. Positions are
-local to the hub that served the read and are not replicated: reading through
-another replica starts that reader over, which repeats messages but never
-skips one.
+whole room, across as many pages as it takes; after that the reader's own
+messages are left out. Positions are local to the hub that served the read
+and are not replicated: reading through another replica starts that reader
+over, which repeats messages but never skips one.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -736,7 +736,9 @@ skips one.
 
 ### `mempalace_room_say`
 
-Post one message to a room, or to one participant in it. Refused once the room is closed.
+Post one message to a room, or to one participant in it. Refused once the room is
+closed, including when a close lands while the call is in flight, and refused
+for a body over 99,000 characters (the largest turn that still files as one drawer).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -755,8 +757,10 @@ Append the outcome and file the transcript verbatim into the palace: one
 drawer per turn (agenda, messages, outcome) in `wing=<project>`,
 `room=<room name>`, `source_file=<room id>`. Each drawer starts with a locator
 line (`[room.message evt_… from=… at=…]`) followed by the original body
-unchanged. Calling it again on a closed room appends nothing and re-files only
-what is missing. Unlike the other room tools it writes to the vector index,
+unchanged. The transcript is every room event at or before the close by HLC,
+so a turn written before the close on another replica and synced here later
+is filed by the next close. Calling it again on a closed room appends nothing
+and re-files only what is missing. Unlike the other room tools it writes to the vector index,
 so it keeps every palace write gate.
 
 | Parameter | Type | Required | Description |
