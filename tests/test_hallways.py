@@ -793,6 +793,64 @@ class TestEntitySpellings:
         assert survivor["id"] == hallways_mod._hallway_id("w", "src/store.py", "view")
 
 
+class TestUnequalCodeExtensionsStayDistinct:
+    """``src/parser.c`` and ``src/parser.h`` are two files, not spellings of one.
+
+    Regression for the review finding on PR #2654: stripping every code
+    extension made unequal explicit extensions collapse, so rebuild omitted
+    their hallway and prune deleted a seeded one as a self-link.
+    """
+
+    def test_canonical_entities_keeps_header_and_implementation(self):
+        from mempalace.hallways import canonical_entities
+
+        assert canonical_entities(["src/parser.c", "src/parser.h"]) == [
+            "src/parser.c",
+            "src/parser.h",
+        ]
+        # Extensionless aliases still collapse onto the unique extension.
+        assert canonical_entities(["mcp_server", "mcp_server.py"]) == ["mcp_server"]
+
+    def test_miner_builds_hallway_between_c_and_h(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection(
+            [
+                {
+                    "wing": "compiler",
+                    "room": "parser",
+                    "entities": "src/parser.c;src/parser.h",
+                },
+                {
+                    "wing": "compiler",
+                    "room": "parser",
+                    "entities": "src/parser.c;src/parser.h",
+                },
+            ]
+        )
+        created = hallways_mod.compute_hallways_for_wing("compiler", col=col, min_count=2)
+        assert len(created) == 1
+        pair = {created[0]["entity_a"], created[0]["entity_b"]}
+        assert pair == {"src/parser.c", "src/parser.h"}
+        assert created[0]["co_occurrence_count"] == 2
+
+    def test_prune_spellings_keeps_c_h_hallway(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        record = {
+            "id": hallways_mod._hallway_id("compiler", "src/parser.c", "src/parser.h"),
+            "wing": "compiler",
+            "entity_a": "src/parser.c",
+            "entity_b": "src/parser.h",
+            "co_occurrence_count": 2,
+        }
+        hallways_mod._save_hallways([record])
+        report = hallways_mod.prune_spelling_hallways(apply=True)
+        assert report["self_links"] == 0
+        assert report["removed"] == 0
+        left = hallways_mod.list_hallways()
+        assert len(left) == 1
+        assert {left[0]["entity_a"], left[0]["entity_b"]} == {"src/parser.c", "src/parser.h"}
+
+
 class TestSameNamedFilesStayApart:
     """``src/models/user.py`` and ``tests/models/user.py`` are two files."""
 
@@ -804,6 +862,10 @@ class TestSameNamedFilesStayApart:
         assert same_file_spelling("mcp_server", "mcp_server.py")
         assert not same_file_spelling("src/models/user.py", "tests/models/user.py")
         assert not same_file_spelling("ChatStore", "RootView")
+        assert not same_file_spelling("src/parser.c", "src/parser.h")
+        assert not same_file_spelling("parser.cpp", "parser.hpp")
+        assert not same_file_spelling("app.ts", "app.tsx")
+
 
     def test_canonical_entities_keeps_distinct_files_apart(self):
         from mempalace.hallways import canonical_entities

@@ -180,14 +180,29 @@ _CODE_EXTENSIONS = frozenset(
 )
 
 
+def _code_extension(entity: str) -> Optional[str]:
+    """Lower-case code extension of ``entity``, or ``None`` if it has none.
+
+    ``src/parser.c`` → ``"c"``; ``mcp_server`` and ``ChatStore.send`` →
+    ``None`` (no known code extension on the basename). Unequal explicit
+    extensions name different files even when their stems match.
+    """
+    base = str(entity).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    stem, dot, ext = base.rpartition(".")
+    if dot and stem and ext.lower() in _CODE_EXTENSIONS:
+        return ext.lower()
+    return None
+
+
 def entity_spelling_key(entity: str) -> str:
     """Basename without a known code extension, lower-cased.
 
     ``src/main.zig``, ``main.zig`` and ``/Users/x/proj/src/main.zig`` all key
     to ``main``; ``mcp_server`` and ``mcp_server.py`` both key to
-    ``mcp_server``. Two entities sharing a key are one thing spelled two
-    ways, so a hallway between them is the entity co-occurring with itself,
-    not an association. Used by the miner to skip such pairs and by
+    ``mcp_server``. The soft key groups candidate aliases; unequal explicit
+    extensions of the same stem (``parser.c`` / ``parser.h``) still key
+    together here and are separated by :func:`same_file_spelling` and
+    :func:`_spelling_clusters`. Used by the miner to skip self-pairs and by
     ``mempalace audit`` / ``mempalace hallways --prune-self-links`` to find
     the ones older mines already wrote.
     """
@@ -345,8 +360,16 @@ def same_file_spelling(a: str, b: str) -> bool:
     ``src/models/user.py`` and ``tests/models/user.py`` are two files that
     happen to share a name. Keying on the basename alone merged their
     associations and let ``--prune-spellings`` delete one of them.
+
+    Unequal explicit code extensions stay distinct: ``src/parser.c`` and
+    ``src/parser.h`` share a stem and a directory, but they are two files.
+    An extensionless spelling may still alias a single extension
+    (``mcp_server`` / ``mcp_server.py``).
     """
     if entity_spelling_key(a) != entity_spelling_key(b):
+        return False
+    ext_a, ext_b = _code_extension(a), _code_extension(b)
+    if ext_a is not None and ext_b is not None and ext_a != ext_b:
         return False
     if _is_diff_pair(a, b):
         return True
@@ -377,18 +400,14 @@ def canonical_spelling(cluster: list[str]) -> str:
     )
 
 
-def _spelling_clusters(entities: list[str]) -> list[list[str]]:
-    """Group spellings of one basename into the distinct files they name.
+def _dir_clusters(entities: list[str]) -> list[list[str]]:
+    """Cluster spellings that already share a stem (and extension policy) by path.
 
     Spellings are bucketed by their directory path. A path that is a suffix
     of exactly one longer path is the same file and joins it (``main.zig``
     under ``src/main.zig``). One that could belong to two or more names no
     file at all (``user.py`` beside ``src/models/user.py`` and
-    ``tests/models/user.py``) and is left out of every cluster: attributing
-    it to either file would be a guess, and keeping it as an entity of its
-    own would pair it with the very files it might be, which
-    :func:`is_self_link` and :func:`association_groups` then rightly call
-    artifacts. Callers skip spellings that appear in no cluster.
+    ``tests/models/user.py``) and is left out of every cluster.
     """
     # ``a/x`` beside ``b/x`` is one file seen through a diff: bucket both
     # under ``x``'s directory so they cluster with each other and with ``x``.
@@ -410,6 +429,40 @@ def _spelling_clusters(entities: list[str]) -> list[list[str]]:
             clusters[hosts[0]].extend(groups[dirs])
         # Two or more hosts: ambiguous, deliberately left out.
     return list(clusters.values())
+
+
+def _spelling_clusters(entities: list[str]) -> list[list[str]]:
+    """Group spellings of one basename into the distinct files they name.
+
+    Unequal explicit code extensions are different files even in the same
+    directory (``src/parser.c`` / ``src/parser.h``). Within one extension,
+    spellings are bucketed by directory path: a path that is a suffix of
+    exactly one longer path joins it (``main.zig`` under ``src/main.zig``);
+    one that could belong to two or more is left out (``user.py`` beside
+    ``src/models/user.py`` and ``tests/models/user.py``). An extensionless
+    spelling joins the unique extension cluster it can only name
+    (``mcp_server`` under ``mcp_server.py``); if it could be more than one
+    file it is left out, the same rule as an ambiguous bare path.
+    Callers skip spellings that appear in no cluster.
+    """
+    by_ext: dict[Optional[str], list[str]] = {}
+    for e in entities:
+        by_ext.setdefault(_code_extension(e), []).append(e)
+    bare = by_ext.pop(None, [])
+    clusters: list[list[str]] = []
+    for group in by_ext.values():
+        clusters.extend(_dir_clusters(group))
+    for spelling in bare:
+        hosts = [c for c in clusters if any(same_file_spelling(spelling, m) for m in c)]
+        if len(hosts) == 1:
+            hosts[0].append(spelling)
+        elif len(hosts) == 0:
+            # A symbol with no extension form (``RootView``, ``mcp_server``)
+            # is a file of its own; only a bare name that could join two or
+            # more extension clusters is left out as ambiguous.
+            clusters.append([spelling])
+        # Several hosts: ambiguous, deliberately left out.
+    return clusters
 
 
 def is_self_link(record) -> bool:
