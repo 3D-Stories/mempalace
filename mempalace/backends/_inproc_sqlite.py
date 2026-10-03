@@ -602,9 +602,7 @@ def _close_and_release(conn: sqlite3.Connection, lock: threading.RLock) -> None:
         lock.release()
 
 
-def _close_reader(
-    conn: sqlite3.Connection, lock: threading.RLock, db_path: str, key: str
-) -> None:
+def _close_reader(conn: sqlite3.Connection, lock: threading.RLock, db_path: str, key: str) -> None:
     """Close the per-call reader, then drop any no-OFD WAL snapshot pin.
 
     Order matters: the helper must still hold SHARED while this process closes
@@ -668,9 +666,7 @@ def open_reader(db_path, *, timeout: Optional[float] = None) -> PalaceSqliteConn
                 _holder_depth[key] = depth
         lock.release()
         raise
-    return PalaceSqliteConnection(
-        conn, lambda: _close_reader(conn, lock, db_path, key)
-    )
+    return PalaceSqliteConnection(conn, lambda: _close_reader(conn, lock, db_path, key))
 
 
 def open_writer(db_path, **connect_kwargs) -> PalaceSqliteConnection:
