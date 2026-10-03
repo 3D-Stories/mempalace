@@ -95,8 +95,8 @@ def _sqlite_taxonomy():
     cache_key = (_config.palace_path, _config.collection_name)
     # Taken before the query, so a write that lands during it invalidates.
     fingerprint = _palace_db_fingerprint()
-    # A readable chroma.sqlite3 changes stat on every commit, so a different
-    # fingerprint recounts even inside the TTL. The TTL is only the fallback
+    # The Chroma database/WAL fingerprint changes on committed writes, so a
+    # different fingerprint recounts even inside the TTL. The TTL is the fallback
     # for backends whose file stat misses commits (sqlite_exact's WAL) and
     # for a palace whose file cannot be stat'ed.
     fingerprint_matches = (
