@@ -850,6 +850,20 @@ class TestUnequalCodeExtensionsStayDistinct:
         assert len(left) == 1
         assert {left[0]["entity_a"], left[0]["entity_b"]} == {"src/parser.c", "src/parser.h"}
 
+    def test_miner_resolves_raw_spellings_against_wing_file_map(self, tmp_path, monkeypatch):
+        """Bare Parser must not hide Parser.c when Parser.h makes it ambiguous wing-wide."""
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection(
+            [
+                {"wing": "w", "room": "r", "entities": "Parser.c;Parser.h"},
+                {"wing": "w", "room": "r", "entities": "Parser;Parser.c;Other"},
+                {"wing": "w", "room": "r", "entities": "Parser.c;Other"},
+            ]
+        )
+        created = hallways_mod.compute_hallways_for_wing("w", col=col, min_count=2)
+        pairs = {tuple(sorted((h["entity_a"], h["entity_b"]))) for h in created}
+        assert ("Other", "Parser.c") in pairs
+
 
 class TestSameNamedFilesStayApart:
     """``src/models/user.py`` and ``tests/models/user.py`` are two files."""

@@ -699,10 +699,13 @@ def compute_hallways_for_wing(
         if meta.get("is_sentinel"):
             continue
         entities = []
-        for spelling in canonical_entities(_parse_entities(meta.get("entities"))):
+        for spelling in _parse_entities(meta.get("entities")):
             # The file this spelling names, not its basename: two files
             # sharing a name must not merge into one entity here either,
-            # or one drawer naming both counts the same pair twice.
+            # or one drawer naming both counts the same pair twice. Resolve
+            # the raw names against the whole wing first: a drawer-local
+            # canonical name such as Parser could hide its explicit Parser.c
+            # when Parser is ambiguous with Parser.h elsewhere in the wing.
             canonical = file_keys.get(spelling)
             if canonical is None:
                 continue  # an ambiguous name: it identifies no single file
