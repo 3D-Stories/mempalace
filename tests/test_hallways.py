@@ -11,7 +11,10 @@ This file is RED-first. The corresponding implementation lives in
 
 from unittest.mock import MagicMock, patch
 
+import itertools
 import json
+
+import pytest
 
 
 # Mock chromadb at import time so the hallways module can be loaded even
@@ -1077,6 +1080,144 @@ class TestDiffAliasesAndEmptyRebuilds:
         (survivor,) = hallways_mod.list_hallways()
         assert {survivor["entity_a"], survivor["entity_b"]} == {"repo/src/user.py", "tests/user.py"}
         assert not hallways_mod.is_self_link(survivor)
+
+
+class TestExtensionlessAliasesNeverBridgeFiles:
+    @pytest.mark.parametrize(
+        ("names", "expected", "ambiguous"),
+        [
+            (
+                ["Router", "src/Router", "tests/Router"],
+                {"src/Router", "tests/Router"},
+                {"Router"},
+            ),
+            (
+                ["Router", "models/Router", "src/models/Router", "tests/models/Router"],
+                {"src/models/Router", "tests/models/Router"},
+                {"Router", "models/Router"},
+            ),
+            (
+                ["Router.py", "src/Router", "tests/Router"],
+                {"src/Router", "tests/Router"},
+                {"Router.py"},
+            ),
+            (
+                ["Router", "src/Router.py", "tests/Router"],
+                {"src/Router.py", "tests/Router"},
+                {"Router"},
+            ),
+            (
+                ["Parser", "src/Parser.c", "src/Parser.h"],
+                {"src/Parser.c", "src/Parser.h"},
+                {"Parser"},
+            ),
+        ],
+    )
+    def test_complete_set_resolves_ambiguity_in_every_order(self, names, expected, ambiguous):
+        for ordering in itertools.permutations(names):
+            assert set(hallways_mod.canonical_entities(ordering)) == expected, ordering
+            mapping = hallways_mod._wing_file_keys([{"entities": ordering}])
+            assert set(mapping.values()) == expected, ordering
+            assert set(mapping) == set(names) - ambiguous, ordering
+
+    @pytest.mark.parametrize(
+        ("names", "expected"),
+        [
+            (["Router", "models/Router", "repo/models/Router"], "repo/models/Router"),
+            (["Router.py", "models/Router", "repo/models/Router"], "repo/models/Router"),
+            (["Router", "models/Router.py", "repo/models/Router.py"], "repo/models/Router.py"),
+            (["Router", "a/src/Router", "b/src/Router", "src/Router"], "src/Router"),
+        ],
+    )
+    def test_unambiguous_suffix_and_diff_aliases_still_combine(self, names, expected):
+        for ordering in itertools.permutations(names):
+            assert hallways_mod.canonical_entities(ordering) == [expected], ordering
+            assert hallways_mod._wing_file_keys([{"entities": ordering}]) == dict.fromkeys(
+                names, expected
+            ), ordering
+
+    def test_rebuild_retains_both_qualified_hallways_and_counts(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        col = _fake_collection(
+            [
+                {"wing": "w", "room": "r", "entities": "Router;src/Router;Peer"},
+                {"wing": "w", "room": "r", "entities": "src/Router;Peer"},
+                {"wing": "w", "room": "r", "entities": "tests/Router;Peer"},
+                {"wing": "w", "room": "r", "entities": "tests/Router;Peer"},
+                # This drawer identifies neither qualified file.
+                {"wing": "w", "room": "r", "entities": "Router;Peer"},
+            ]
+        )
+        for _ in range(2):
+            hallways_mod.compute_hallways_for_wing("w", col=col, min_count=2)
+            stored = hallways_mod.list_hallways()
+            assert {(h["entity_a"], h["entity_b"]): h["co_occurrence_count"] for h in stored} == {
+                ("Peer", "src/Router"): 2,
+                ("Peer", "tests/Router"): 2,
+            }
+            assert hallways_mod.prune_spelling_hallways(apply=True)["removed"] == 0
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_prune_preserves_ambiguous_halls_and_removes_only_unique_duplicate(
+        self, tmp_path, monkeypatch, reverse
+    ):
+        from mempalace.palace_audit import _analyze_hallways
+
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        names = ["Router", "models/Router", "src/models/Router", "tests/models/Router"]
+        rows = [
+            {
+                "id": f"h-{i}",
+                "wing": "w",
+                "entity_a": name,
+                "entity_b": "Peer",
+                "co_occurrence_count": 10 - i,
+            }
+            for i, name in enumerate(names)
+        ]
+        # Only this more-qualified src alias is a proven duplicate.
+        rows.append(
+            {
+                "id": "duplicate",
+                "wing": "w",
+                "entity_a": "repo/src/models/Router",
+                "entity_b": "Peer",
+                "co_occurrence_count": 1,
+            }
+        )
+        if reverse:
+            rows.reverse()
+        hallways_mod._save_hallways(rows)
+        assert _analyze_hallways(rows)["duplicates"] == 1
+        report = hallways_mod.prune_spelling_hallways(apply=True)
+        assert report["removed"] == 1
+        assert {h["entity_a"] for h in hallways_mod.list_hallways()} == {
+            "Router",
+            "models/Router",
+            "repo/src/models/Router",
+            "tests/models/Router",
+        }
+        assert hallways_mod.prune_spelling_hallways(apply=True)["removed"] == 0
+
+    def test_prune_explicit_c_alias_preserves_header(self, tmp_path, monkeypatch):
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        hallways_mod._save_hallways(
+            [
+                {
+                    "id": f"h-{i}",
+                    "wing": "w",
+                    "entity_a": name,
+                    "entity_b": "Peer",
+                    "co_occurrence_count": 10 - i,
+                }
+                for i, name in enumerate(["src/parser.c", "parser.c", "src/parser.h"])
+            ]
+        )
+        assert hallways_mod.prune_spelling_hallways(apply=True)["removed"] == 1
+        assert {h["entity_a"] for h in hallways_mod.list_hallways()} == {
+            "src/parser.c",
+            "src/parser.h",
+        }
 
 
 class TestAmbiguousRecordsNeverBridgeFiles:

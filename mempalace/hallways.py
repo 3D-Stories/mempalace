@@ -400,37 +400,6 @@ def canonical_spelling(cluster: list[str]) -> str:
     )
 
 
-def _dir_clusters(entities: list[str]) -> list[list[str]]:
-    """Cluster spellings that already share a stem (and extension policy) by path.
-
-    Spellings are bucketed by their directory path. A path that is a suffix
-    of exactly one longer path is the same file and joins it (``main.zig``
-    under ``src/main.zig``). One that could belong to two or more names no
-    file at all (``user.py`` beside ``src/models/user.py`` and
-    ``tests/models/user.py``) and is left out of every cluster.
-    """
-    # ``a/x`` beside ``b/x`` is one file seen through a diff: bucket both
-    # under ``x``'s directory so they cluster with each other and with ``x``.
-    resolved = _diff_resolved(entities)
-    groups: dict[tuple, list[str]] = {}
-    for e in entities:
-        groups.setdefault(tuple(_dir_segments(resolved.get(e, e))), []).append(e)
-    by_length = sorted(groups, key=len, reverse=True)
-    maximal: list[tuple] = []
-    for dirs in by_length:
-        if not any(len(m) > len(dirs) and m[len(m) - len(dirs) :] == dirs for m in maximal):
-            maximal.append(dirs)
-    clusters: dict[tuple, list[str]] = {m: list(groups[m]) for m in maximal}
-    for dirs in by_length:
-        if dirs in clusters:
-            continue
-        hosts = [m for m in maximal if len(m) > len(dirs) and m[len(m) - len(dirs) :] == dirs]
-        if len(hosts) == 1:
-            clusters[hosts[0]].extend(groups[dirs])
-        # Two or more hosts: ambiguous, deliberately left out.
-    return list(clusters.values())
-
-
 def _spelling_clusters(entities: list[str]) -> list[list[str]]:
     """Group spellings of one basename into the distinct files they name.
 
@@ -445,23 +414,33 @@ def _spelling_clusters(entities: list[str]) -> list[list[str]]:
     file it is left out, the same rule as an ambiguous bare path.
     Callers skip spellings that appear in no cluster.
     """
-    by_ext: dict[Optional[str], list[str]] = {}
-    for e in entities:
-        by_ext.setdefault(_code_extension(e), []).append(e)
-    bare = by_ext.pop(None, [])
+    # Resolve diff prefixes against the complete set, as their paired
+    # spellings may otherwise look like incompatible directories.
+    names = list(dict.fromkeys(entities))
+    resolved = _diff_resolved(names)
+    matches = {
+        name: {
+            other
+            for other in names
+            if same_file_spelling(resolved.get(name, name), resolved.get(other, other))
+        }
+        for name in names
+    }
+    # A short path or missing extension must never bridge incompatible
+    # files. Decide ambiguity before building any cluster: adding Router
+    # to src/Router first would let tests/Router join through that alias.
+    # Every pair of possible hosts must agree, including intermediate
+    # suffixes and extensionless paths, regardless of input order.
+    unambiguous = {
+        name for name, hosts in matches.items() if all(hosts <= matches[host] for host in hosts)
+    }
     clusters: list[list[str]] = []
-    for group in by_ext.values():
-        clusters.extend(_dir_clusters(group))
-    for spelling in bare:
-        hosts = [c for c in clusters if any(same_file_spelling(spelling, m) for m in c)]
-        if len(hosts) == 1:
-            hosts[0].append(spelling)
-        elif len(hosts) == 0:
-            # A symbol with no extension form (``RootView``, ``mcp_server``)
-            # is a file of its own; only a bare name that could join two or
-            # more extension clusters is left out as ambiguous.
-            clusters.append([spelling])
-        # Several hosts: ambiguous, deliberately left out.
+    for name in names:
+        if name not in unambiguous:
+            continue
+        cluster = [other for other in names if other in unambiguous and other in matches[name]]
+        clusters.append(cluster)
+        unambiguous.difference_update(cluster)
     return clusters
 
 
