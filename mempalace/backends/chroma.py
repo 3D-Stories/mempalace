@@ -2499,7 +2499,9 @@ def _sqlite_hydrate_rows(conn, selected, value_columns):
             )
             if key == "chroma:document":
                 records[row_id][1] = value
-            elif key is not None and value is not None:
+            elif key is not None and not key.startswith("chroma:") and value is not None:
+                # Collection.get keeps internal fields (notably chroma:uri)
+                # out of user metadata, even when URIs were stored with rows.
                 records[row_id][2][key] = value
     return [tuple(records[row_id]) for row_id, _ in selected]
 
