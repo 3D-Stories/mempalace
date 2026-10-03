@@ -97,12 +97,15 @@ class RoomSet:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "RoomSet":
+    def from_dict(cls, data: dict, *, normalize_names: bool = True) -> "RoomSet":
         rooms = []
         for raw in data.get("rooms") or []:
             if not isinstance(raw, dict):
                 continue
-            name = sanitize_name(slugify_room(str(raw.get("name") or "")), "room")
+            name = str(raw.get("name") or "")
+            # Model proposals need slugging; approved files already carry the
+            # chosen legal spelling, including names snapped to existing rooms.
+            name = sanitize_name(slugify_room(name) if normalize_names else name, "room")
             rooms.append(
                 RoomSpec(
                     name=name,
@@ -160,7 +163,7 @@ def save_room_set(config: MempalaceConfig, room_set: RoomSet) -> str:
 def load_room_set(config: MempalaceConfig, wing: str) -> RoomSet:
     path = room_set_path(config, wing)
     with open(path, encoding="utf-8") as f:
-        return RoomSet.from_dict(json.load(f))
+        return RoomSet.from_dict(json.load(f), normalize_names=False)
 
 
 # ── sampling ─────────────────────────────────────────────────────────────────
@@ -299,6 +302,9 @@ def _assign_user_prompt(wing: str, room_set: RoomSet, samples: list[dict]) -> st
 def _record_exemplars(room_set: RoomSet, samples: list[dict], assignments: list[dict]) -> int:
     """Attach sampled drawer ids to the rooms the LLM assigned them to."""
     by_name = {r.name: r for r in room_set.rooms}
+    by_slug: dict[str, list[RoomSpec]] = {}
+    for room in room_set.rooms:
+        by_slug.setdefault(slugify_room(room.name), []).append(room)
     attached = 0
     for a in assignments:
         if not isinstance(a, dict):
@@ -307,7 +313,11 @@ def _record_exemplars(room_set: RoomSet, samples: list[dict], assignments: list[
             index = int(a.get("excerpt"))
         except (TypeError, ValueError):
             continue
-        room = by_name.get(slugify_room(str(a.get("room") or "")))
+        name = str(a.get("room") or "")
+        room = by_name.get(name)
+        if room is None:
+            matches = by_slug.get(slugify_room(name), [])
+            room = matches[0] if len(matches) == 1 else None
         if room is None or not (1 <= index <= len(samples)):
             continue
         drawer_id = samples[index - 1]["id"]
