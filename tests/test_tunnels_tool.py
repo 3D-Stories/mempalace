@@ -292,3 +292,49 @@ def test_apply_proposal_skips_a_link_created_meanwhile_under_another_spelling(
     assert apply_proposal(plan) == 1
     rooms = sorted(t["source"]["room"] for t in pg.list_tunnels())
     assert rooms == ["entity:Router", "entity:main.py"]
+
+def test_prune_keeps_qualified_links_when_bare_alias_is_ambiguous():
+    """A high-count bare filename must not erase two distinct qualified paths.
+
+    Regression for the review finding on PR #2654 (F2): prune sorted by
+    access_count, inserted bare ``CodeRouter.py`` first, then pairwise
+    suffix-matched both ``src/models/CodeRouter.py`` and
+    ``tests/fixtures/CodeRouter.py`` as its duplicates.
+    """
+    def tunnel(name, entity, count):
+        return {
+            "id": name,
+            "kind": "entity",
+            "access_count": count,
+            "source": {"wing": "alpha", "room": "entity:" + entity},
+            "target": {"wing": "beta", "room": "entity:" + entity},
+        }
+
+    rows = [
+        tunnel("ambiguous", "CodeRouter.py", 10),
+        tunnel("production", "src/models/CodeRouter.py", 5),
+        tunnel("test-fixture", "tests/fixtures/CodeRouter.py", 3),
+    ]
+    kept, report = prune_tunnels(rows, {"alpha", "beta"})
+    kept_ids = {r["id"] for r in kept}
+    assert {"production", "test-fixture"} <= kept_ids, (
+        "two distinct qualified connections were pruned by an ambiguous basename"
+    )
+
+    # Same acceptance when a qualified path has the highest count.
+    rows_qualified_first = [
+        tunnel("production", "src/models/CodeRouter.py", 10),
+        tunnel("ambiguous", "CodeRouter.py", 5),
+        tunnel("test-fixture", "tests/fixtures/CodeRouter.py", 3),
+    ]
+    kept2, _ = prune_tunnels(rows_qualified_first, {"alpha", "beta"})
+    assert {"production", "test-fixture"} <= {r["id"] for r in kept2}
+
+    # Unambiguous bare + one qualified path still collapses to one link.
+    alone = [
+        tunnel("bare", "swim.zig", 10),
+        tunnel("qualified", "src/swim.zig", 5),
+    ]
+    kept3, report3 = prune_tunnels(alone, {"alpha", "beta"})
+    assert len(kept3) == 1
+    assert report3["duplicates"] == 1
