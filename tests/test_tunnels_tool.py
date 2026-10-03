@@ -293,6 +293,7 @@ def test_apply_proposal_skips_a_link_created_meanwhile_under_another_spelling(
     rooms = sorted(t["source"]["room"] for t in pg.list_tunnels())
     assert rooms == ["entity:Router", "entity:main.py"]
 
+
 def test_prune_keeps_qualified_links_when_bare_alias_is_ambiguous():
     """A high-count bare filename must not erase two distinct qualified paths.
 
@@ -301,6 +302,7 @@ def test_prune_keeps_qualified_links_when_bare_alias_is_ambiguous():
     suffix-matched both ``src/models/CodeRouter.py`` and
     ``tests/fixtures/CodeRouter.py`` as its duplicates.
     """
+
     def tunnel(name, entity, count):
         return {
             "id": name,

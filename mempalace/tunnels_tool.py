@@ -109,7 +109,11 @@ def ambiguous_entity_spellings(spellings: Iterable[str]) -> set[str]:
     ambiguous: set[str] = set()
     for group in by_key.values():
         for spelling in group:
-            hosts = [other for other in group if other != spelling and same_file_spelling(spelling, other)]
+            hosts = [
+                other
+                for other in group
+                if other != spelling and same_file_spelling(spelling, other)
+            ]
             distinct: list[str] = []
             for host in hosts:
                 if not any(same_file_spelling(host, kept) for kept in distinct):
@@ -157,9 +161,19 @@ class LinkIndex:
     def contains(self, ends: tuple) -> bool:
         (wa, ra), (wb, rb) = ends
         for (wa2, ra2), (wb2, rb2) in self._buckets.get(self._bucket(ends), []):
-            if wa == wa2 and wb == wb2 and self._endpoint_match(ra, ra2) and self._endpoint_match(rb, rb2):
+            if (
+                wa == wa2
+                and wb == wb2
+                and self._endpoint_match(ra, ra2)
+                and self._endpoint_match(rb, rb2)
+            ):
                 return True
-            if wa == wb2 and wb == wa2 and self._endpoint_match(ra, rb2) and self._endpoint_match(rb, ra2):
+            if (
+                wa == wb2
+                and wb == wa2
+                and self._endpoint_match(ra, rb2)
+                and self._endpoint_match(rb, ra2)
+            ):
                 return True
         return False
 
