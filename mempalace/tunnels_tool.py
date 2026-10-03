@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from itertools import combinations
 from typing import Iterable, Optional
 
 from .config import MempalaceConfig, normalize_wing_name
@@ -103,9 +104,9 @@ def ambiguous_entity_spellings(spellings: Iterable[str]) -> set[str]:
     ambiguous when it ``same_file_spelling``-matches two hosts that are not
     the same file as each other.
     """
-    by_key: dict[str, list[str]] = {}
+    by_key: dict[str, set[str]] = {}
     for spelling in spellings:
-        by_key.setdefault(entity_spelling_key(spelling), []).append(spelling)
+        by_key.setdefault(entity_spelling_key(spelling), set()).add(spelling)
     ambiguous: set[str] = set()
     for group in by_key.values():
         for spelling in group:
@@ -114,11 +115,10 @@ def ambiguous_entity_spellings(spellings: Iterable[str]) -> set[str]:
                 for other in group
                 if other != spelling and same_file_spelling(spelling, other)
             ]
-            distinct: list[str] = []
-            for host in hosts:
-                if not any(same_file_spelling(host, kept) for kept in distinct):
-                    distinct.append(host)
-            if len(distinct) >= 2:
+            # Check every pair: a shared suffix such as models/CodeRouter.py
+            # can match both src/models/CodeRouter.py and
+            # tests/models/CodeRouter.py without making those the same file.
+            if any(not same_file_spelling(a, b) for a, b in combinations(hosts, 2)):
                 ambiguous.add(spelling)
     return ambiguous
 

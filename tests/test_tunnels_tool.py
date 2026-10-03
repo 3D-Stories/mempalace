@@ -2,11 +2,13 @@
 
 import json
 from argparse import Namespace
+from itertools import permutations
 
 import pytest
 
 from mempalace.config import MempalaceConfig
 from mempalace.tunnels_tool import (
+    ambiguous_entity_spellings,
     apply_proposal,
     load_proposal,
     propose_tunnels,
@@ -340,3 +342,53 @@ def test_prune_keeps_qualified_links_when_bare_alias_is_ambiguous():
     kept3, report3 = prune_tunnels(alone, {"alpha", "beta"})
     assert len(kept3) == 1
     assert report3["duplicates"] == 1
+
+
+@pytest.mark.parametrize("basename", ["CodeRouter.py", "CodeRouter"])
+def test_prune_keeps_nested_ambiguous_aliases_in_every_order(basename):
+    """An intermediate suffix cannot hide two incompatible qualified hosts."""
+    spellings = (
+        basename,
+        f"models/{basename}",
+        f"src/models/{basename}",
+        f"tests/models/{basename}",
+    )
+    for ordering in permutations(spellings):
+        assert ambiguous_entity_spellings(ordering) == set(spellings[:2])
+        rows = [
+            {
+                "id": spelling,
+                "access_count": len(ordering) - index,
+                "source": {"wing": "alpha", "room": f"entity:{spelling}"},
+                "target": {"wing": "beta", "room": f"entity:{spelling}"},
+            }
+            for index, spelling in enumerate(ordering)
+        ]
+        # Identical qualified endpoints still deduplicate, even when reversed.
+        rows.append(
+            {
+                "id": "duplicate",
+                "source": {"wing": "beta", "room": f"entity:{spellings[2]}"},
+                "target": {"wing": "alpha", "room": f"entity:{spellings[2]}"},
+            }
+        )
+        kept, report = prune_tunnels(rows, {"alpha", "beta"})
+        assert {row["id"] for row in kept} == set(spellings)
+        assert report["duplicates"] == report["removed"] == 1
+
+
+def test_prune_collapses_an_unambiguous_suffix_chain_in_every_order():
+    spellings = ("CodeRouter.py", "models/CodeRouter.py", "src/models/CodeRouter.py")
+    for ordering in permutations(spellings):
+        assert ambiguous_entity_spellings(ordering) == set()
+        rows = [
+            {
+                "id": spelling,
+                "source": {"wing": "alpha", "room": f"entity:{spelling}"},
+                "target": {"wing": "beta", "room": f"entity:{spelling}"},
+            }
+            for spelling in ordering
+        ]
+        kept, report = prune_tunnels(rows, {"alpha", "beta"})
+        assert [row["id"] for row in kept] == [ordering[0]]
+        assert report["duplicates"] == report["removed"] == 2
