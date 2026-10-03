@@ -866,7 +866,6 @@ class TestSameNamedFilesStayApart:
         assert not same_file_spelling("parser.cpp", "parser.hpp")
         assert not same_file_spelling("app.ts", "app.tsx")
 
-
     def test_canonical_entities_keeps_distinct_files_apart(self):
         from mempalace.hallways import canonical_entities
 
