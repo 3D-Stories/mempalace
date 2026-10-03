@@ -52,11 +52,13 @@ This module is the one door for that access.
 * Everywhere else connections open and close per call, still under the lock.
   Windows locks belong to a handle, so a close never drops another handle's
   locks. POSIX platforms without OFD locks (macOS) keep the same promise with
-  a helper process: its WAL read transaction is another process's SHARED
-  lock, so it conflicts with Chroma where an in-process fcntl lock
-  would not, and closing a connection in this process cannot drop it. The
-  in-process anchor is installed only after that helper is holding, so
-  Chroma cannot recreate ``-wal``/``-shm`` under a parked wal-index.
+  a helper process: while a reader is open its WAL read transaction is
+  another process's SHARED lock, so it conflicts with Chroma where an
+  in-process fcntl lock would not, and closing a connection in this process
+  cannot drop it. The in-process anchor is installed only after that helper
+  is holding. When the reader closes, the helper ends its snapshot (so later
+  writes can checkpoint) but stays alive to re-prime on the next read —
+  a process-lifetime pin of an obsolete WAL snapshot blocked checkpoints.
 """
 
 from __future__ import annotations
@@ -114,6 +116,7 @@ _registry_lock = threading.Lock()
 _locks: dict[str, threading.RLock] = {}
 _anchors: dict[str, "_Anchor"] = {}
 _holders: dict[str, "_Holder"] = {}
+_holder_depth: dict[str, int] = {}
 
 # Self-contained: the helper must not import this package. Importing
 # mempalace.backends pulls Chroma into the process whose only job is to hold
@@ -124,6 +127,8 @@ from urllib.request import pathname2url
 
 db_path = sys.argv[1]
 uri = "file:" + pathname2url(db_path) + "?mode=ro"
+conn = None
+holding = False
 
 def open_conn():
     # Same sidecar rule as connect_sqlite_read. A WAL file with no sidecars
@@ -142,13 +147,6 @@ def open_conn():
             return sqlite3.connect(db_path, timeout=0.0)
     return sqlite3.connect(uri, uri=True, timeout=0.0)
 
-try:
-    conn = open_conn()
-except sqlite3.Error:
-    sys.stdout.write("failed\\n")
-    sys.stdout.flush()
-    raise SystemExit(0)
-
 def prime():
     global conn
     # Read before checking the mode so a new transaction sees any external
@@ -163,7 +161,10 @@ def prime():
         row = conn.execute("PRAGMA journal_mode").fetchone()
     except sqlite3.Error:
         if conn is not None:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
         raise
     if row and str(row[0]).lower() == "wal":
         return True
@@ -177,32 +178,53 @@ def prime():
     conn = None
     return False
 
+def release_snapshot():
+    global conn, holding
+    if conn is not None:
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        except sqlite3.Error:
+            pass
+    holding = False
+
 def report(line):
     sys.stdout.write(line + "\\n")
     sys.stdout.flush()
 
 try:
+    conn = open_conn()
+except sqlite3.Error:
+    report("failed")
+    raise SystemExit(0)
+
+try:
     holding = prime()
 except sqlite3.Error:
     report("busy")
+    holding = False
 else:
     report("ready" if holding else "idle")
-    if holding:
-        sys.stdin.read()
-        raise SystemExit(0)
 
+# Command loop: a blank nudge re-primes; "release" ends a WAL snapshot so
+# writers can checkpoint, without exiting (cross-process lock protection is
+# re-acquired on the next open_reader). EOF exits.
 while True:
-    if sys.stdin.readline() == "":
+    line = sys.stdin.readline()
+    if line == "":
         raise SystemExit(0)
+    cmd = line.strip()
+    if cmd == "release":
+        release_snapshot()
+        report("idle")
+        continue
     try:
         holding = prime()
     except sqlite3.Error:
         report("busy")
+        holding = False
     else:
         report("ready" if holding else "idle")
-        if holding:
-            sys.stdin.read()
-            raise SystemExit(0)
 """
 
 
@@ -433,6 +455,28 @@ def _stop_holder(holder: _Holder, *, wait: bool) -> None:
             pass
 
 
+def _release_holder_snapshot(holder: _Holder) -> None:
+    """End the helper's WAL read transaction without killing the process.
+
+    A completed parent read must not pin an obsolete snapshot forever: later
+    writes need to checkpoint. The helper stays alive and re-primes on the
+    next :func:`open_reader`, restoring cross-process SHARED protection for
+    that read's close.
+    """
+    if not holder.ready or holder.proc.stdin is None or holder.proc.stdin.closed:
+        holder.ready = False
+        return
+    try:
+        holder.proc.stdin.write("release\n")
+        holder.proc.stdin.flush()
+    except OSError:
+        holder.ready = False
+        return
+    if _read_holder_line(holder.proc) == "idle":
+        holder.ready = False
+        holder.shm_ino = None
+
+
 def _start_holder(db_path: str, ident: tuple[int, int]) -> Optional[_Holder]:
     try:
         proc = subprocess.Popen(
@@ -558,13 +602,45 @@ def _close_and_release(conn: sqlite3.Connection, lock: threading.RLock) -> None:
         lock.release()
 
 
+def _close_reader(
+    conn: sqlite3.Connection, lock: threading.RLock, db_path: str, key: str
+) -> None:
+    """Close the per-call reader, then drop any no-OFD WAL snapshot pin.
+
+    Order matters: the helper must still hold SHARED while this process closes
+    its descriptor (that close drops every lock this process held on the file,
+    Chroma's included). After the close, release the helper's snapshot so later
+    writers can checkpoint, and drop the in-process anchor that was only safe
+    while the helper was holding.
+    """
+    try:
+        conn.close()
+    finally:
+        try:
+            if _HOLD_LOCKS:
+                depth = _holder_depth.get(key, 0) - 1
+                if depth <= 0:
+                    _holder_depth.pop(key, None)
+                    holder = _holders.get(key)
+                    if holder is not None:
+                        _release_holder_snapshot(holder)
+                    anchor = _anchors.pop(key, None)
+                    if anchor is not None:
+                        anchor.discard()
+                else:
+                    _holder_depth[key] = depth
+        finally:
+            lock.release()
+
+
 def open_reader(db_path, *, timeout: Optional[float] = None) -> PalaceSqliteConnection:
     """Open ``db_path`` for reading under :func:`palace_db_lock`.
 
     Same failure contract as :func:`mempalace.config.connect_sqlite_read`
     (``sqlite3.Error`` for a database SQLite cannot open, ``ValueError`` for a
     path the URI cannot carry). The caller must ``close()`` the result, which
-    releases the lock.
+    releases the lock. On the no-OFD helper path, close also ends the helper's
+    read snapshot so WAL checkpoints can proceed; the next open re-primes it.
     """
     db_path = os.fspath(db_path)
     key = _key(db_path)
@@ -573,6 +649,7 @@ def open_reader(db_path, *, timeout: Optional[float] = None) -> PalaceSqliteConn
     try:
         if _HOLD_LOCKS:
             _ensure_holder(db_path, key)
+            _holder_depth[key] = _holder_depth.get(key, 0) + 1
         # The in-process anchor parks descriptors so a per-call close does not
         # drop Chroma's locks. Without OFD locks that anchor is only safe once
         # another process is already holding SHARED, which stops Chroma from
@@ -583,9 +660,17 @@ def open_reader(db_path, *, timeout: Optional[float] = None) -> PalaceSqliteConn
         kwargs = {} if timeout is None else {"timeout": timeout}
         conn = connect_sqlite_read(db_path, **kwargs)
     except BaseException:
+        if _HOLD_LOCKS:
+            depth = _holder_depth.get(key, 0) - 1
+            if depth <= 0:
+                _holder_depth.pop(key, None)
+            else:
+                _holder_depth[key] = depth
         lock.release()
         raise
-    return PalaceSqliteConnection(conn, lambda: _close_and_release(conn, lock))
+    return PalaceSqliteConnection(
+        conn, lambda: _close_reader(conn, lock, db_path, key)
+    )
 
 
 def open_writer(db_path, **connect_kwargs) -> PalaceSqliteConnection:
@@ -615,6 +700,7 @@ def release(db_path) -> None:
     db_path = os.fspath(db_path)
     key = _key(db_path)
     with _lock_for_key(key):
+        _holder_depth.pop(key, None)
         anchor = _anchors.pop(key, None)
         if anchor is not None:
             anchor.discard()
@@ -630,6 +716,7 @@ def release_all() -> None:
         holders = list(_holders.values())
         _anchors.clear()
         _holders.clear()
+        _holder_depth.clear()
     for anchor in anchors:
         anchor.discard()
     for holder in holders:
@@ -641,12 +728,13 @@ def _reset_after_fork_in_child() -> None:
     # leaves the inherited descriptors alone (closing them would drop locks).
     # The helper belongs to the parent: drop this process's pipe dup and do
     # not signal the helper to exit.
-    global _registry_lock, _locks, _anchors, _holders
+    global _registry_lock, _locks, _anchors, _holders, _holder_depth
     holders = list(_holders.values())
     _registry_lock = threading.Lock()
     _locks = {}
     _anchors = {}
     _holders = {}
+    _holder_depth = {}
     for holder in holders:
         _stop_holder(holder, wait=False)
 

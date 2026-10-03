@@ -446,8 +446,12 @@ def test_open_reader_keeps_a_holder_until_release(tmp_path, monkeypatch):
     try:
         with contextlib.closing(_inproc_sqlite.open_reader(db)) as reader:
             assert reader.execute("SELECT count(*) FROM t").fetchone() == (1,)
-        holder = _inproc_sqlite._holders[_inproc_sqlite._key(str(db))]
-        assert holder.ready
+            holder = _inproc_sqlite._holders[_inproc_sqlite._key(str(db))]
+            assert holder.ready
+            assert holder.alive()
+        # After close the helper releases its WAL snapshot so writers can
+        # checkpoint, but the process stays for the next open_reader.
+        assert not holder.ready
         assert holder.alive()
     finally:
         _inproc_sqlite.release(db)
@@ -494,7 +498,7 @@ def test_idle_rollback_holder_allows_external_commits_and_fresh_reads(tmp_path, 
     assert not holder.alive()
 
 
-def test_idle_holder_detects_delete_to_wal_and_retains_checkpoint_guard(tmp_path, monkeypatch):
+def test_idle_holder_detects_delete_to_wal_and_releases_snapshot_after_read(tmp_path, monkeypatch):
     monkeypatch.setattr(_inproc_sqlite, "_HOLD_LOCKS", True)
     monkeypatch.setattr(_inproc_sqlite, "_ANCHORED", False)
     monkeypatch.setattr(_inproc_sqlite, "_F_OFD_SETLK", None)
@@ -512,14 +516,15 @@ def test_idle_holder_detects_delete_to_wal_and_retains_checkpoint_guard(tmp_path
         assert _run(_EXTERNAL_WAL_SWITCH, db) == "wal"
         with contextlib.closing(_inproc_sqlite.open_reader(db)) as reader:
             assert reader.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+            assert holder.ready
         assert _inproc_sqlite._holders[key] is holder
-        assert holder.ready
+        # Close released the snapshot; the helper stays for the next read.
+        assert not holder.ready
         assert holder.alive()
 
-        # WAL permits the writer's commit while the helper's read transaction
-        # prevents that writer from truncating the live wal-index.
+        # After the read completes, writers must be able to checkpoint.
         during = json.loads(_run(_EXTERNAL_SQLITE_WRITE, db, 1, "checkpoint"))
-        assert during == {"journal_mode": "wal", "rows": 2, "checkpoint_busy": 1}
+        assert during == {"journal_mode": "wal", "rows": 2, "checkpoint_busy": 0}
     finally:
         _inproc_sqlite.release(db)
 
@@ -527,3 +532,43 @@ def test_idle_holder_detects_delete_to_wal_and_retains_checkpoint_guard(tmp_path
     assert key not in _inproc_sqlite._holders
     after = json.loads(_run(_EXTERNAL_SQLITE_WRITE, db, 2, "checkpoint"))
     assert after == {"journal_mode": "wal", "rows": 3, "checkpoint_busy": 0}
+
+
+def test_wal_helper_does_not_pin_snapshot_after_reader_closes(tmp_path, monkeypatch):
+    """A completed no-OFD read must not pin a WAL snapshot for process life.
+
+    Regression for the review finding on PR #2654 (F5): the helper began a
+    read transaction and waited until release()/exit, so after one
+    open_reader/close, 2000 updates grew the WAL to ~8MB instead of ~41KB.
+    """
+    import os
+
+    monkeypatch.setattr(_inproc_sqlite, "_HOLD_LOCKS", True)
+    monkeypatch.setattr(_inproc_sqlite, "_ANCHORED", False)
+    monkeypatch.setattr(_inproc_sqlite, "_F_OFD_SETLK", None)
+    db = str(tmp_path / "chroma.sqlite3")
+    writer = sqlite3.connect(db)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=10")
+    writer.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")
+    writer.execute("INSERT INTO t VALUES(1, zeroblob(4096))")
+    writer.commit()
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    try:
+        with contextlib.closing(_inproc_sqlite.open_reader(db)) as reader:
+            assert reader.execute("SELECT count(*) FROM t").fetchone() == (1,)
+        for i in range(1, 2001):
+            writer.execute(
+                "UPDATE t SET payload=? WHERE id=1",
+                (i.to_bytes(4, "little") + b"x" * 4092,),
+            )
+            writer.commit()
+        wal_bytes = os.stat(db + "-wal").st_size
+        passive = writer.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        # Former per-call reader stays ~41KB with checkpoint (0,10,10).
+        # The pinned helper grew to ~8.2MB with (0,2001,0).
+        assert wal_bytes < 200_000, (wal_bytes, passive)
+        assert passive[2] > 0, passive  # some frames checkpointed
+    finally:
+        _inproc_sqlite.release(db)
+        writer.close()
