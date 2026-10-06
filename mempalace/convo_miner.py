@@ -42,6 +42,7 @@ from .palace import (
     mine_lock,
     mine_palace_lock,
     mine_yield_point,
+    palace_write_serial,
     prefetch_content_hashes,
     prefetch_mined_set,
 )
@@ -1075,6 +1076,7 @@ def _mine_convos_impl(
 ):
     from .config import MempalaceConfig
 
+    writes_at_start = palace_write_serial()
     palace_config = MempalaceConfig(palace_path=palace_path)
     cfg_chunk_size = palace_config.chunk_size
     # Only override convo_miner's MIN_CHUNK_SIZE when the user has set
@@ -1281,7 +1283,7 @@ def _mine_convos_impl(
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
         _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
-        _validate_palace_fts5_after_mine(palace_path)
+        _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
     print(f"\n{'=' * 55}")
     print("  Done.")
