@@ -37,6 +37,7 @@ from .palace import (
     mine_lock,
     mine_palace_lock,
     mine_yield_point,
+    palace_write_serial,
     prefetch_complete_mtimes,
     purge_file_closets,
     upsert_closet_lines,
@@ -2310,6 +2311,7 @@ def _mine_impl(
 ):
     from .config import MempalaceConfig
 
+    writes_at_start = palace_write_serial()
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
     palace_config = MempalaceConfig()
@@ -2474,7 +2476,7 @@ def _mine_impl(
                     file=sys.stderr,
                 )
 
-            _validate_palace_fts5_after_mine(palace_path)
+            _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
         print(f"\n{'=' * 55}")
         print("  Done.")

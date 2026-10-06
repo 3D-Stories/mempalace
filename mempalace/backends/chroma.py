@@ -12,6 +12,7 @@ import shlex
 import sqlite3
 import weakref
 import struct
+import threading
 import time
 from collections import defaultdict
 from numbers import Integral
@@ -3125,6 +3126,26 @@ def _clear_chroma_system_cache() -> bool:
         _clearing_system_cache = False
 
 
+# How many writes ChromaCollection instances in this process have started.
+# A mine compares it before and after to learn whether it wrote anything, and
+# skips its post-mine quick_check when it did not (#2684). Process-wide rather
+# than per palace: a write to another palace in between costs one extra check,
+# never a missed one.
+_write_serial = 0
+_write_serial_lock = threading.Lock()
+
+
+def chroma_write_serial() -> int:
+    """Number of Chroma writes (add, upsert, update, delete) started in this process."""
+    return _write_serial
+
+
+def _count_write() -> None:
+    global _write_serial
+    with _write_serial_lock:
+        _write_serial += 1
+
+
 class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
@@ -3166,7 +3187,10 @@ class ChromaCollection(BaseCollection):
         next collection open rebuilds the client, reloading every HNSW segment
         it had already paid for. That made the file-a-drawer-then-search cycle
         reload the whole index each time.
+
+        Counts the write first, so one that fails partway still counts.
         """
+        _count_write()
         if self._palace_path is None:
             yield
             return
