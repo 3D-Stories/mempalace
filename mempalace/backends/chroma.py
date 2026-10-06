@@ -2092,6 +2092,7 @@ def _sqlite_iter_metadata(
     collection_name: str,
     keys: Optional[Iterable[str]],
     require_key: Optional[str],
+    equals: Optional[dict] = None,
 ) -> Iterator[Optional[dict]]:
     """Stream each drawer's metadata from an open chroma.sqlite3 connection, in row order.
 
@@ -2099,9 +2100,12 @@ def _sqlite_iter_metadata(
     them is skipped. With ``keys=None``, every non-internal key is read and a
     drawer without metadata yields ``None``, the way Chroma's ``get`` returns
     it. ``require_key`` limits the scan to drawers holding a string value
-    under that key, found through the ``(key, string_value)`` index. Chroma's
-    own paging is a SQL ``OFFSET``, which re-walks every skipped row, so a
-    full pass that way is quadratic in the number of drawers.
+    under that key, found through the ``(key, string_value)`` index.
+    ``equals`` limits it further to drawers whose string value under each key
+    equals the given one, through the same index, so a pass over one wing
+    reads that wing's rows rather than the whole collection. Chroma's own
+    paging is a SQL ``OFFSET``, which re-walks every skipped row, so a full
+    pass that way is quadratic in the number of drawers.
     """
     scope = """
         SELECT e.id FROM embeddings e
@@ -2114,6 +2118,10 @@ def _sqlite_iter_metadata(
         scope += """ AND e.id IN (SELECT r.id FROM embedding_metadata r
                      WHERE r.key = ? AND r.string_value IS NOT NULL)"""
         params.append(require_key)
+    for key, value in (equals or {}).items():
+        scope += """ AND e.id IN (SELECT r.id FROM embedding_metadata r
+                     WHERE r.key = ? AND r.string_value = ?)"""
+        params.extend((key, value))
     # Older chromadb schemas lack bool_value; select NULL for any value
     # column the table does not have so the row shape stays fixed.
     present = set(_metadata_value_columns(conn))
@@ -3452,11 +3460,15 @@ class ChromaCollection(BaseCollection):
         return self._collection.count()
 
     def iter_metadata(
-        self, keys: Optional[Iterable[str]] = None, *, require_key: Optional[str] = None
+        self,
+        keys: Optional[Iterable[str]] = None,
+        *,
+        require_key: Optional[str] = None,
+        equals: Optional[dict] = None,
     ) -> Optional[Iterator[Optional[dict]]]:
         """Stream every drawer's metadata from chroma.sqlite3 in one linear pass.
 
-        ``keys`` and ``require_key`` narrow the read (see
+        ``keys``, ``require_key`` and ``equals`` narrow the read (see
         :func:`_sqlite_iter_metadata`). Returns ``None`` when this collection
         has no palace path or no database file, so the caller can page through
         :meth:`get` instead. A read error raises from the iterator.
@@ -3471,7 +3483,7 @@ class ChromaCollection(BaseCollection):
         def rows():
             conn = open_palace_reader(db_path)
             try:
-                yield from _sqlite_iter_metadata(conn, name, keys, require_key)
+                yield from _sqlite_iter_metadata(conn, name, keys, require_key, equals)
             finally:
                 conn.close()
 
@@ -3648,7 +3660,9 @@ class ChromaCollection(BaseCollection):
                 # If a metadata filter is present, do not cap before filtering:
                 # otherwise a common term can fill the window with wrong-scope
                 # rows and hide valid scoped hits later in the FTS result set.
-                limit_sql = "" if where else "LIMIT ?"
+                # Without a filter, rank the window so it holds the best matches
+                # rather than the first ones filed.
+                limit_sql = "" if where else "ORDER BY embedding_fulltext_search.rank LIMIT ?"
                 params = [fts_query, collection_name]
                 if not where:
                     params.append(max(max_candidates, n_results))
