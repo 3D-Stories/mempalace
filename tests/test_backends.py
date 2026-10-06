@@ -1057,6 +1057,26 @@ def test_chroma_iter_metadata_projects_keys_and_requires_a_key(tmp_path):
     assert list(col.iter_metadata(["wing"], require_key="missing_key")) == []
 
 
+def test_chroma_iter_metadata_equals_scopes_the_scan(tmp_path):
+    col = _recent_palace(tmp_path)
+    everything = [m for m in col.get_all_metadata() if m]
+    rare = list(col.iter_metadata(["wing", "room"], equals={"wing": "rare"}))
+    assert rare == [
+        {"wing": m["wing"], "room": m["room"]} for m in everything if m["wing"] == "rare"
+    ]
+    assert len(rare) == 4
+    # Several equalities all apply, and they combine with require_key.
+    rare_x = list(col.iter_metadata(["room"], equals={"wing": "rare", "room": "x"}))
+    assert rare_x == [{"room": "x"}] * sum(
+        1 for m in everything if m["wing"] == "rare" and m["room"] == "x"
+    )
+    dated_a = list(col.iter_metadata(["wing"], require_key="filed_at", equals={"wing": "a"}))
+    assert len(dated_a) == sum(
+        1 for m in everything if m["wing"] == "a" and isinstance(m.get("filed_at"), str)
+    )
+    assert list(col.iter_metadata(["wing"], equals={"wing": "no_such_wing"})) == []
+
+
 def test_chroma_backend_accepts_palace_ref_kwarg(tmp_path):
     palace_path = tmp_path / "palace"
     backend = ChromaBackend()

@@ -558,26 +558,31 @@ def _wing_metadata_from_sqlite(col, wing: str) -> Optional[list]:
     which Chroma runs as SQL ``OFFSET``: every page re-walks the rows before
     it, so a large wing costs the square of its size (#2684).
 
-    Only drawers holding ``entities`` are read, through the ``(key,
-    string_value)`` index: a drawer without them neither forms a pair nor
-    names a file, so the hallways come out the same. A wing none of whose
-    drawers hold any still has to replace its old hallways with none, so one
-    bounded ``get`` tells it apart from a wing with no drawers at all.
+    The read is scoped to the wing in sqlite, and only drawers holding
+    ``entities`` are read, both through the ``(key, string_value)`` index, so
+    a small wing in a large palace reads its own rows rather than the
+    palace's. A drawer without entities neither forms a pair nor names a
+    file, so the hallways come out the same. A wing none of whose drawers
+    hold any still has to replace its old hallways with none, so a second
+    scoped read, stopped at its first row, tells it apart from a wing with no
+    drawers at all.
     """
     from .palace import _fast_collection_metadata
 
-    rows = _fast_collection_metadata(col, _HALLWAY_KEYS, require_key="entities")
-    if rows is None:
-        return None
+    scope = {"wing": wing}
     try:
+        rows = _fast_collection_metadata(col, _HALLWAY_KEYS, require_key="entities", equals=scope)
+        if rows is None:
+            return None
         metadatas = [m for m in rows if isinstance(m, dict) and m.get("wing") == wing]
         if not metadatas:
-            probe = col.get(where={"wing": wing}, limit=1, include=["metadatas"])
-            metadatas = [
-                m
-                for m in (probe or {}).get("metadatas") or []
-                if isinstance(m, dict) and m.get("wing") == wing
-            ]
+            probe = _fast_collection_metadata(col, _HALLWAY_KEYS, equals=scope)
+            try:
+                first = next(probe, None)
+            finally:
+                probe.close()
+            if isinstance(first, dict) and first.get("wing") == wing:
+                metadatas = [first]
     except Exception:
         logger.warning(
             "compute_hallways_for_wing: sqlite metadata scan failed for %s; paging instead",

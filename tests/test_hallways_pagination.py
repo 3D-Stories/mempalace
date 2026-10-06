@@ -221,6 +221,35 @@ class TestComputeHallwaysSqlitePass:
         monkeypatch.setattr(ChromaCollection, "get", _no_paging)
         created = hallways_mod.compute_hallways_for_wing("w", col=col, min_count=1)
         assert created
+        # A wing whose drawers hold no entities is told apart from an empty
+        # wing through sqlite too, not through a get that loads the index.
+        assert hallways_mod.compute_hallways_for_wing("bare", col=col, min_count=1) == []
+
+    def test_sqlite_pass_reads_only_the_wing(self, tmp_path, monkeypatch):
+        """The scan is scoped to the wing in sqlite, so a small wing in a
+        large palace does not read every other wing's drawers."""
+        from mempalace.backends.chroma import ChromaCollection
+
+        col = _chroma_fixture_palace(tmp_path)
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        real = ChromaCollection.iter_metadata
+        scopes = []
+        yielded = []
+
+        def recording(self, keys=None, *, require_key=None, equals=None):
+            scopes.append(equals)
+            for meta in real(self, keys, require_key=require_key, equals=equals):
+                yielded.append(meta)
+                yield meta
+
+        monkeypatch.setattr(ChromaCollection, "iter_metadata", recording)
+        hallways_mod.compute_hallways_for_wing("w", col=col, min_count=1)
+        hallways_mod.compute_hallways_for_wing("bare", col=col, min_count=1)
+
+        # "bare" holds no entities, so its scan comes back empty and the
+        # empty-wing probe runs, still scoped.
+        assert scopes == [{"wing": "w"}, {"wing": "bare"}, {"wing": "bare"}]
+        assert yielded and all(meta["wing"] in ("w", "bare") for meta in yielded)
 
     def test_wing_without_entities_still_replaces_its_old_hallways(self, tmp_path, monkeypatch):
         """The sqlite pass reads only drawers with entities; a wing whose
@@ -248,7 +277,7 @@ class TestComputeHallwaysSqlitePass:
         col = _chroma_fixture_palace(tmp_path)
         expected = _compute_both_ways(tmp_path / "ref", monkeypatch, col, "w")["paged"]
 
-        def breaks_after_one_row(self, keys=None, *, require_key=None):
+        def breaks_after_one_row(self, keys=None, *, require_key=None, equals=None):
             def gen():
                 yield {"wing": "w", "entities": "Alice;Bob"}
                 raise sqlite3.OperationalError("injected failure")
