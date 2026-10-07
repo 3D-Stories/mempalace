@@ -287,10 +287,7 @@ def split_pending_path(config: MempalaceConfig, wing: str) -> str:
 
 def split_plan_fingerprint(plan: dict) -> str:
     """Digest of the wing and each project's target — the decisions apply_split follows."""
-    targets = {
-        str(key): str(entry["target"])
-        for key, entry in sorted(plan["projects"].items())
-    }
+    targets = {str(key): str(entry["target"]) for key, entry in sorted(plan["projects"].items())}
     payload = json.dumps(
         {"wing": str(plan["wing"]), "targets": targets},
         sort_keys=True,
