@@ -55,6 +55,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
 import threading
 from typing import Optional
 
@@ -364,13 +365,50 @@ def _embeddinggemma_gather_patch(model_path: str):
         return None
 
 
+# ONNX Runtime honours ``session.model_external_initializers_file_folder_path``
+# for a model loaded from memory from 1.21 on. Older releases (1.19.2 is the
+# newest that installs on Python 3.9; 1.20.x ignores it too) drop the option
+# and resolve the external data against the process working directory, so the
+# patched model either fails to load or, when the working directory holds a
+# file of the same name, silently runs with that file's weights.
+_ORT_MIN_EXTERNAL_DATA_FOLDER = (1, 21)
+
+
+def _ort_honours_external_data_folder(ort) -> bool:
+    """Whether ``ort`` can load a patched model's external data from memory.
+
+    An unparseable version counts as too old: the cost of skipping the
+    rewrite is memory, the cost of loading it on a release that ignores the
+    folder option can be the wrong weights.
+    """
+    match = re.match(r"(\d+)\.(\d+)", str(getattr(ort, "__version__", "")))
+    if match is None:
+        return False
+    return (int(match.group(1)), int(match.group(2))) >= _ORT_MIN_EXTERNAL_DATA_FOLDER
+
+
 def _new_embeddinggemma_session(ort, model_path, patch, intra_op_num_threads, providers):
     """Build an EmbeddingGemma session, from ``patch`` when there is one.
 
     A patched model loads from memory, pointed at its external data's real
     directory. If ONNX Runtime refuses it, the file at ``model_path`` loads
     unchanged instead, so the rewrite can cost memory but never the model.
+    On an ONNX Runtime too old to point an in-memory model at its external
+    data, a patch that has external data is not tried at all.
     """
+    if (
+        patch is not None
+        and patch.external_data_dir is not None
+        and not _ort_honours_external_data_folder(ort)
+    ):
+        logger.info(
+            "onnxruntime %s cannot load the rewritten EmbeddingGemma graph's external "
+            "data from memory (needs >= %d.%d); loading it unchanged, which "
+            "dequantizes the full token table on every run",
+            getattr(ort, "__version__", "?"),
+            *_ORT_MIN_EXTERNAL_DATA_FOLDER,
+        )
+        patch = None
     if patch is not None:
         so = _intra_op_session_options(intra_op_num_threads) or ort.SessionOptions()
         if patch.external_data_dir is not None:

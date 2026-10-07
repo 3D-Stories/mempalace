@@ -5,8 +5,11 @@ helpers the rewrite uses, so the tests need neither the ``onnx`` package
 nor a downloaded model.
 """
 
+import logging
 import os
+import re
 import struct
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -27,6 +30,18 @@ from mempalace.onnx_graph import (  # noqa: E402
 
 FLOAT, INT8, INT64 = 1, 3, 7
 VOCAB, DIM = 50, 8
+
+# ONNX Runtime < 1.21 ignores the external-data folder option for a model
+# loaded from memory and looks in the working directory instead.
+_FOLDER_OPTION_HONOURED = embedding._ort_honours_external_data_folder(ort)
+needs_external_data_folder = pytest.mark.skipif(
+    not _FOLDER_OPTION_HONOURED,
+    reason=f"onnxruntime {ort.__version__} ignores the external-data folder option",
+)
+# ONNX Runtime rejects external data that resolves outside the model's
+# directory from 1.24 on; 1.19-1.23 load it.
+_ORT_MINOR = tuple(int(x) for x in re.match(r"(\d+)\.(\d+)", ort.__version__).groups())
+_VALIDATES_EXTERNAL_DATA_PATHS = _ORT_MINOR >= (1, 24)
 
 
 def _varint_field(number, value):
@@ -199,6 +214,7 @@ def test_scalar_scale_without_dims_is_eligible(tmp_path):
         assert np.array_equal(x, y)
 
 
+@needs_external_data_folder
 def test_external_data_loads_from_memory(tmp_path):
     path = tmp_path / "m.onnx"
     raw = _model(path, external="weights.bin")
@@ -229,10 +245,13 @@ def test_symlinked_external_data_points_at_the_real_file(tmp_path):
     assert patch.external_data_dir == os.path.realpath(blobs)
     assert b"9f2c" in patch.model_bytes
     # The model file and its data resolve into different real directories,
-    # which ONNX Runtime refuses when loading from the path (#2601); the
-    # patched model, loaded from memory, is not subject to that.
-    with pytest.raises(Exception, match="escapes"):
-        _run(str(path), IDS)
+    # which ONNX Runtime >= 1.24 refuses when loading from the path (#2601);
+    # the patched model, loaded from memory, is not subject to that.
+    if _VALIDATES_EXTERNAL_DATA_PATHS:
+        with pytest.raises(Exception, match="escapes"):
+            _run(str(path), IDS)
+    if not _FOLDER_OPTION_HONOURED:
+        return  # the in-memory load below needs onnxruntime >= 1.21
     plain = tmp_path / "plain"
     plain.mkdir()
     _model(plain / "m.onnx", external="weights.bin")
@@ -263,6 +282,112 @@ def test_session_falls_back_to_the_file_when_the_patch_is_rejected(tmp_path, mon
     assert session.run(None, {"ids": IDS})
 
 
+@pytest.mark.parametrize(
+    "version, honoured",
+    [
+        ("1.19.2", False),
+        ("1.20.1", False),
+        ("1.21.0", True),
+        ("1.22.0.dev20250101", True),
+        ("1.30.0", True),
+        ("2.0.0", True),
+        ("", False),
+        ("unknown", False),
+    ],
+)
+def test_external_data_folder_needs_onnxruntime_1_21(version, honoured):
+    assert (
+        embedding._ort_honours_external_data_folder(SimpleNamespace(__version__=version))
+        is honoured
+    )
+
+
+def _recording_ort(version):
+    """An ``onnxruntime`` stand-in that records what each session loads from."""
+    loads = []
+
+    class Options:
+        def __init__(self):
+            self.config = {}
+
+        def add_session_config_entry(self, key, value):
+            self.config[key] = value
+
+    def session(model, sess_options=None, providers=None):
+        loads.append((model, getattr(sess_options, "config", {})))
+        return object()
+
+    return SimpleNamespace(
+        __version__=version, SessionOptions=Options, InferenceSession=session
+    ), loads
+
+
+def test_old_onnxruntime_loads_an_external_data_patch_from_the_path(tmp_path, caplog):
+    path = tmp_path / "m.onnx"
+    raw = _model(path, external="weights.bin")
+    (tmp_path / "weights.bin").write_bytes(raw)
+    patch = gather_before_dequantize(str(path))
+    fake, loads = _recording_ort("1.20.1")
+
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        embedding._new_embeddinggemma_session(fake, str(path), patch, 0, ["CPUExecutionProvider"])
+    assert [model for model, _config in loads] == [str(path)]
+    assert not caplog.records
+
+
+def test_old_onnxruntime_still_uses_a_patch_without_external_data(tmp_path):
+    path = tmp_path / "m.onnx"
+    _model(path)
+    patch = gather_before_dequantize(str(path))
+    fake, loads = _recording_ort("1.19.2")
+
+    embedding._new_embeddinggemma_session(fake, str(path), patch, 0, ["CPUExecutionProvider"])
+    assert [model for model, _config in loads] == [patch.model_bytes]
+
+
+def test_new_onnxruntime_points_the_patch_at_its_external_data(tmp_path):
+    path = tmp_path / "m.onnx"
+    raw = _model(path, external="weights.bin")
+    (tmp_path / "weights.bin").write_bytes(raw)
+    patch = gather_before_dequantize(str(path))
+    fake, loads = _recording_ort("1.21.0")
+
+    embedding._new_embeddinggemma_session(fake, str(path), patch, 0, ["CPUExecutionProvider"])
+    assert loads == [
+        (
+            patch.model_bytes,
+            {"session.model_external_initializers_file_folder_path": patch.external_data_dir},
+        )
+    ]
+
+
+def test_external_data_session_reads_the_model_weights_not_the_working_directory(
+    tmp_path, monkeypatch, caplog
+):
+    """On the installed onnxruntime, whichever way the session loads, it reads
+    the model's own weights: a same-named file in the working directory, which
+    onnxruntime < 1.21 would pick up for an in-memory model, is never used."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    path = model_dir / "m.onnx"
+    raw = _model(path, external="weights.bin")
+    (model_dir / "weights.bin").write_bytes(raw)
+    expected = _run(str(path), IDS)
+    patch = gather_before_dequantize(str(path))
+
+    decoy = tmp_path / "cwd"
+    decoy.mkdir()
+    (decoy / "weights.bin").write_bytes(bytes(len(raw)))
+    monkeypatch.chdir(decoy)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        session = embedding._new_embeddinggemma_session(
+            ort, str(path), patch, 0, ["CPUExecutionProvider"]
+        )
+    for x, y in zip(expected, session.run(None, {"ids": IDS})):
+        assert x.dtype == y.dtype and np.array_equal(x, y)
+    assert not caplog.records
+
+
 def test_patch_is_skipped_quietly_for_a_missing_file(tmp_path, caplog):
     assert embedding._embeddinggemma_gather_patch(str(tmp_path / "absent.onnx")) is None
     assert not caplog.records
@@ -283,6 +408,7 @@ _REAL_MODEL = os.environ.get("MEMPALACE_TEST_EMBEDDINGGEMMA_ONNX", "")
 @pytest.mark.skipif(
     not os.path.isfile(_REAL_MODEL), reason="MEMPALACE_TEST_EMBEDDINGGEMMA_ONNX not set"
 )
+@needs_external_data_folder
 def test_real_embeddinggemma_vectors_are_bitwise_identical():
     model_path = _REAL_MODEL
     patch = gather_before_dequantize(model_path)
