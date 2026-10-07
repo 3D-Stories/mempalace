@@ -31,8 +31,8 @@ def print_files_failed(failed_files: list) -> None:
     """Add the failed-file count to a mine summary; nothing when none failed."""
     if failed_files:
         print(
-            f"  Files failed: {len(failed_files)} (not mined; errors above, "
-            "retried on the next mine)"
+            f"  Files failed: {len(failed_files)} (not mined; per-file errors went to "
+            "stderr, retried on the next mine)"
         )
 
 

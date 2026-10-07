@@ -94,6 +94,8 @@ def test_mcp_mine_reports_success_false_with_the_failure_count(monkeypatch, conf
     assert "the server's stderr over MCP" in result["error"]
     # The summary the mine printed still reaches the caller.
     assert "Files failed: 2" in result["output"] and "Done." in result["output"]
+    assert "errors above" not in result["output"]
+    assert "per-file errors went to stderr" in result["output"]
 
 
 def test_mcp_mine_without_failures_still_succeeds(monkeypatch, config, tmp_path):
