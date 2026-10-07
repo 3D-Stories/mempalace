@@ -274,14 +274,91 @@ def test_save_config_keeps_hand_written_keys_in_mempalace_yaml(tmp_path):
     assert data["exclude_patterns"] == ["*.log"]
 
 
-def test_save_config_overwrites_an_unparseable_config_in_place(tmp_path):
+# A broken config is user data init cannot read. It is regenerated (init has
+# to write something the miner can use) but only after a byte-exact copy is
+# kept beside it, and the user is told where.
+BROKEN = (
+    "# hand-written, keep me\nwing: [unclosed\nexclude_patterns:\n  - secret/ # café\n".encode()
+)
+
+
+@pytest.mark.parametrize("name", ["mempalace.yml", "mempalace.yaml", "mempal.yaml", "mempal.yml"])
+def test_save_config_backs_up_an_unparseable_config(tmp_path, capsys, name):
     import yaml
 
-    (tmp_path / "mempalace.yml").write_text("wing: [unclosed\n", encoding="utf-8")
+    (tmp_path / name).write_bytes(BROKEN)
+
     save_config(str(tmp_path), "myproject", ROOMS)
-    assert not (tmp_path / "mempalace.yaml").exists()
-    data = yaml.safe_load((tmp_path / "mempalace.yml").read_text(encoding="utf-8"))
+
+    backup = tmp_path / f"{name}.bak"
+    assert backup.read_bytes() == BROKEN
+    data = yaml.safe_load((tmp_path / name).read_text(encoding="utf-8"))
     assert data == {"wing": "myproject", "rooms": ROOMS}
+    if name != "mempalace.yaml":
+        assert not (tmp_path / "mempalace.yaml").exists()
+    out = capsys.readouterr()
+    assert str(backup) in out.err
+    assert "does not parse" in out.err
+
+
+def test_save_config_warns_before_regenerating(tmp_path, capsys, monkeypatch):
+    """The backup and the warning both happen before the config is rewritten."""
+    import mempalace.room_detector_local as rdl
+
+    (tmp_path / "mempalace.yml").write_bytes(BROKEN)
+    seen_at_dump = {}
+    real_dump = rdl.yaml.dump
+
+    def spy_dump(*args, **kwargs):
+        seen_at_dump["err"] = capsys.readouterr().err
+        seen_at_dump["backup"] = (tmp_path / "mempalace.yml.bak").read_bytes()
+        return real_dump(*args, **kwargs)
+
+    monkeypatch.setattr(rdl.yaml, "dump", spy_dump)
+    save_config(str(tmp_path), "myproject", ROOMS)
+
+    assert str(tmp_path / "mempalace.yml.bak") in seen_at_dump["err"]
+    assert seen_at_dump["backup"] == BROKEN
+
+
+def test_save_config_never_clobbers_an_existing_backup(tmp_path, capsys):
+    older = b"wing: an older backup the user kept\n"
+    (tmp_path / "mempalace.yml.bak").write_bytes(older)
+    (tmp_path / "mempalace.yml").write_bytes(BROKEN)
+
+    save_config(str(tmp_path), "myproject", ROOMS)
+
+    assert (tmp_path / "mempalace.yml.bak").read_bytes() == older
+    new_backups = sorted(tmp_path.glob("mempalace.yml.bak.*"))
+    assert len(new_backups) == 1, new_backups
+    assert new_backups[0].read_bytes() == BROKEN
+    assert str(new_backups[0]) in capsys.readouterr().err
+
+
+def test_save_config_backs_up_a_config_that_is_not_a_mapping(tmp_path):
+    (tmp_path / "mempalace.yml").write_bytes(b"- just\n- a list\n")
+    save_config(str(tmp_path), "myproject", ROOMS)
+    assert (tmp_path / "mempalace.yml.bak").read_bytes() == b"- just\n- a list\n"
+
+
+def test_save_config_does_not_back_up_an_empty_config(tmp_path):
+    (tmp_path / "mempalace.yml").write_bytes(b"\n")
+    save_config(str(tmp_path), "myproject", ROOMS)
+    assert list(tmp_path.glob("*.bak*")) == []
+
+
+def test_save_config_refuses_to_regenerate_when_the_backup_fails(tmp_path, monkeypatch):
+    import mempalace.room_detector_local as rdl
+
+    (tmp_path / "mempalace.yml").write_bytes(BROKEN)
+
+    def no_backup(path, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(rdl, "_write_backup", no_backup)
+    with pytest.raises(OSError, match="not overwritten"):
+        save_config(str(tmp_path), "myproject", ROOMS)
+    assert (tmp_path / "mempalace.yml").read_bytes() == BROKEN
 
 
 def test_init_then_load_config_sees_the_yml_settings(tmp_path):
