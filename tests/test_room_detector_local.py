@@ -347,6 +347,24 @@ def test_save_config_does_not_back_up_an_empty_config(tmp_path):
     assert list(tmp_path.glob("*.bak*")) == []
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [b"# exclude_patterns:\n#   - secret/\n", b"# keep me\n{}\n", b"~ # nothing yet\n"],
+)
+def test_save_config_backs_up_a_config_that_parses_as_empty(tmp_path, capsys, raw):
+    """Comments-only bytes parse to nothing but are still the user's file."""
+    import yaml
+
+    (tmp_path / "mempalace.yml").write_bytes(raw)
+
+    save_config(str(tmp_path), "myproject", ROOMS)
+
+    assert (tmp_path / "mempalace.yml.bak").read_bytes() == raw
+    data = yaml.safe_load((tmp_path / "mempalace.yml").read_text(encoding="utf-8"))
+    assert data == {"wing": "myproject", "rooms": ROOMS}
+    assert "parses as empty" in capsys.readouterr().err
+
+
 def test_save_config_refuses_to_regenerate_when_the_backup_fails(tmp_path, monkeypatch):
     import mempalace.room_detector_local as rdl
 

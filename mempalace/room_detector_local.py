@@ -355,6 +355,10 @@ def save_config(project_dir: str, project_name: str, rooms: list):
             config = {**config, **{k: v for k, v in previous.items() if k not in config}}
         elif problem is None and previous is not None:
             problem = "is not a mapping"
+        if problem is None and not previous:
+            # Comments only (or ``{}`` / ``~``): parses to nothing, but the
+            # bytes are still the user's and the rewrite drops them.
+            problem = "parses as empty"
         if problem is not None and raw.strip():
             # Init has to write a config the miner can use, but the file it
             # replaces is the user's and could not be read: keep a byte-exact
