@@ -16,6 +16,8 @@ import yaml
 from pathlib import Path
 from collections import defaultdict
 
+from .project_config import find_project_config
+
 logger = logging.getLogger(__name__)
 
 # Common room patterns — detected from folder names and filenames
@@ -291,7 +293,23 @@ def save_config(project_dir: str, project_name: str, rooms: list):
             for r in rooms
         ],
     }
-    config_path = Path(project_dir).expanduser().resolve() / "mempalace.yaml"
+    project_path = Path(project_dir).expanduser().resolve()
+    # Update the config the miner will actually read. A project that already
+    # has ``mempalace.yml`` (or a legacy ``mempal.*``) keeps it: writing a new
+    # ``mempalace.yaml`` beside it would shadow it, and every setting in it
+    # would stop applying without a word (#2676).
+    existing_path = find_project_config(project_path)
+    config_path = existing_path or project_path / "mempalace.yaml"
+    if existing_path is not None:
+        # Keep what init does not generate (``exclude_patterns`` and any
+        # other hand-written key); init only owns ``wing`` and ``rooms``.
+        try:
+            with open(existing_path, encoding="utf-8") as f:
+                previous = yaml.safe_load(f)
+        except (OSError, ValueError, yaml.YAMLError):
+            previous = None
+        if isinstance(previous, dict):
+            config = {**config, **{k: v for k, v in previous.items() if k not in config}}
     # Opening a pre-existing FIFO for writing blocks in the kernel until a
     # reader appears. Only a regular file is a valid config target; refuse
     # loudly rather than park ``init`` with no output.

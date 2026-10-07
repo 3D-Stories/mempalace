@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from mempalace.room_detector_local import (
     FOLDER_ROOM_MAP,
     detect_rooms_from_files,
@@ -236,6 +238,64 @@ def test_save_config_valid_yaml(tmp_path):
     assert data["wing"] == "test_proj"
     assert len(data["rooms"]) == 1
     assert data["rooms"][0]["name"] == "general"
+
+
+ROOMS = [{"name": "backend", "description": "Server files", "keywords": ["backend"]}]
+
+
+@pytest.mark.parametrize("existing", ["mempalace.yml", "mempal.yaml", "mempal.yml"])
+def test_save_config_updates_an_existing_alternate_config(tmp_path, existing):
+    """init rewrites the config the miner reads instead of creating a
+    mempalace.yaml that would shadow it, and keeps hand-written keys."""
+    import yaml
+
+    (tmp_path / existing).write_text(
+        "wing: old\nrooms: []\nexclude_patterns:\n  - secret/\n", encoding="utf-8"
+    )
+
+    save_config(str(tmp_path), "myproject", ROOMS)
+
+    assert not (tmp_path / "mempalace.yaml").exists()
+    data = yaml.safe_load((tmp_path / existing).read_text(encoding="utf-8"))
+    assert data["wing"] == "myproject"
+    assert [r["name"] for r in data["rooms"]] == ["backend"]
+    assert data["exclude_patterns"] == ["secret/"]
+
+
+def test_save_config_keeps_hand_written_keys_in_mempalace_yaml(tmp_path):
+    import yaml
+
+    (tmp_path / "mempalace.yaml").write_text(
+        "wing: old\nrooms: []\nexclude_patterns: ['*.log']\n", encoding="utf-8"
+    )
+    save_config(str(tmp_path), "myproject", ROOMS)
+    data = yaml.safe_load((tmp_path / "mempalace.yaml").read_text(encoding="utf-8"))
+    assert data["wing"] == "myproject"
+    assert data["exclude_patterns"] == ["*.log"]
+
+
+def test_save_config_overwrites_an_unparseable_config_in_place(tmp_path):
+    import yaml
+
+    (tmp_path / "mempalace.yml").write_text("wing: [unclosed\n", encoding="utf-8")
+    save_config(str(tmp_path), "myproject", ROOMS)
+    assert not (tmp_path / "mempalace.yaml").exists()
+    data = yaml.safe_load((tmp_path / "mempalace.yml").read_text(encoding="utf-8"))
+    assert data == {"wing": "myproject", "rooms": ROOMS}
+
+
+def test_init_then_load_config_sees_the_yml_settings(tmp_path):
+    """Round trip: after save_config, the miner's load_config still applies
+    the user's exclude_patterns from mempalace.yml."""
+    from mempalace.miner import load_config
+
+    (tmp_path / "mempalace.yml").write_text(
+        "wing: old\nrooms: []\nexclude_patterns: ['secret/']\n", encoding="utf-8"
+    )
+    save_config(str(tmp_path), "myproject", ROOMS)
+    config = load_config(str(tmp_path))
+    assert config["wing"] == "myproject"
+    assert config["exclude_patterns"] == ["secret/"]
 
 
 # ── print_proposed_structure ──────────────────────────────────────────
