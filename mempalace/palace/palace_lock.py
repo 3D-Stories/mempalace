@@ -20,7 +20,8 @@ class MineFileErrors(RuntimeError):
             raise ValueError("MineFileErrors requires at least one failed file")
         super().__init__(
             f"{len(failed_files)} of {total_files} file(s) failed to mine; "
-            "their errors are in the mine output, and the next mine retries them"
+            "per-file errors went to stderr (the server's stderr over MCP, the "
+            "terminal on the CLI), and the next mine retries them"
         )
         self.failed_files: tuple[str, ...] = tuple(failed_files)
         self.total_files = total_files
