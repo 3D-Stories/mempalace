@@ -192,7 +192,7 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mo
   error, error_class: "MineFileErrors", files_failed, failed_files }
 ```
 
-`files_failed` is the number of files that failed. `failed_files` lists their paths, capped at the first 20. `error` reads `"N of M file(s) failed to mine; their errors are in the mine output, and the next mine retries them"`. Only stdout is captured into `output`, so the per-file `! [error] ... stale-drawer purge failed` lines go to the server's stderr (its log), not into `output`. The CLI behaves the same way: `mempalace mine` prints the summary, then `mempalace: N of M file(s) failed to mine; ...` on stderr, and exits `1`.
+`files_failed` is the number of files that failed. `failed_files` lists their paths, capped at the first 20. `error` reads `"N of M file(s) failed to mine; per-file errors went to stderr (the server's stderr over MCP, the terminal on the CLI), and the next mine retries them"`. Only stdout is captured into `output`, so the per-file `! [error] ... stale-drawer purge failed` lines go to the server's stderr (its log), not into `output`. The CLI behaves the same way: `mempalace mine` prints the summary, then `mempalace: N of M file(s) failed to mine; ...` on stderr, and exits `1`.
 
 ---
 
