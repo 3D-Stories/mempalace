@@ -952,6 +952,26 @@ class MempalaceConfig:
         return os.path.join(os.path.dirname(self.palace_path), "hallways.json")
 
     @property
+    def hallway_skip_wings(self):
+        """Wings whose hallways are never computed.
+
+        ``compute_hallways_for_wing`` does not walk a listed wing and drops its old records
+        from the hallway file. Meant for raw-transcript wings: their entity pairs are noise,
+        and walking hundreds of thousands of drawers holds the palace write lock for minutes.
+        ``MEMPALACE_HALLWAY_SKIP_WINGS`` (comma-separated) overrides ``hallways.skip_wings``
+        in config.json, and an empty value turns skipping off. A value that is not a list made
+        only of strings skips nothing, because skipping drops records. Default: no wing is skipped.
+        """
+        env_val = os.environ.get("MEMPALACE_HALLWAY_SKIP_WINGS")
+        if env_val is not None:
+            return [w.strip() for w in env_val.split(",") if w.strip()]
+        hallways = self._file_config.get("hallways", {})
+        wings = hallways.get("skip_wings", []) if isinstance(hallways, dict) else []
+        if not isinstance(wings, list) or not all(isinstance(w, str) for w in wings):
+            return []
+        return [w.strip() for w in wings if w.strip()]
+
+    @property
     def collection_name(self):
         """ChromaDB collection name."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
@@ -1130,6 +1150,27 @@ class MempalaceConfig:
             return env_val.lower() not in ("false", "0", "no")
         hooks = self._file_config.get("hooks", {})
         return hooks.get("auto_save", True)
+
+    @property
+    def hooks_mine_transcript(self):
+        """Whether hooks mine the raw session transcript into the palace.
+
+        Separate from ``hooks_auto_save``, which gates the compressed diary
+        checkpoint. The checkpoint holds the last user prompts, truncated;
+        the transcript mine files the whole session verbatim, tool output
+        included. Those have very different privacy and volume profiles —
+        one Bash result can carry a token, and one long session can file
+        thousands of drawers — so they need separate switches. Default True
+        keeps existing behavior; set False to keep continuity checkpoints
+        without archiving every command's output.
+        """
+        env_val = os.environ.get("MEMPALACE_HOOKS_MINE_TRANSCRIPT")
+        if env_val is not None:
+            return env_val.lower() not in ("false", "0", "no")
+        hooks = self._file_config.get("hooks", {})
+        if not isinstance(hooks, dict):
+            return True
+        return hooks.get("mine_transcript", True)
 
     @property
     def topic_wings(self):

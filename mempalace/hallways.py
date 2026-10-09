@@ -157,6 +157,27 @@ def _save_hallways(hallways: list[dict], config=None) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _skip_wings(config=None) -> list[str]:
+    """Wings listed in ``MempalaceConfig.hallway_skip_wings``."""
+    from .config import MempalaceConfig
+
+    return (config or MempalaceConfig()).hallway_skip_wings
+
+
+def _drop_wing_hallways(wing: str, config=None) -> None:
+    """Remove ``wing``'s records from the hallway file; rewrite it only if any existed."""
+    existing = _load_hallways(config)
+    kept = [h for h in existing if h.get("wing") != wing]
+    if len(kept) == len(existing):
+        return
+    _save_hallways(kept, config)
+    logger.info(
+        "hallways: %s is in hallways.skip_wings; dropped its %d old records",
+        wing,
+        len(existing) - len(kept),
+    )
+
+
 def _parse_entities(value) -> list[str]:
     """Drawer ``entities`` metadata is a semicolon-separated string. Parse it.
 
@@ -242,6 +263,13 @@ def compute_hallways_for_wing(
         List of hallway dicts created for this wing. Records for other
         wings already on disk are preserved.
     """
+    # A wing in ``hallways.skip_wings`` is never walked, and its old records are dropped.
+    # Raw-transcript wings yield only noise pairs, and walking one inside the hub's write
+    # lock stalled every peer session for minutes.
+    if wing in _skip_wings(config):
+        _drop_wing_hallways(wing, config)
+        return []
+
     if col is None:
         logger.debug("compute_hallways_for_wing: no collection provided for %s", wing)
         return []
