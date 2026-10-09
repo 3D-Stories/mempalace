@@ -921,7 +921,7 @@ def _split_new_and_duplicate_conversations(
     new_items = []
     duplicates = []
     for conversation in conversations:
-        content_hash = hashlib.sha256(conversation.strip().encode("utf-8")).hexdigest()
+        content_hash = _conversation_hash(conversation)
         dup_source = mined_content_hashes.get((wing, content_hash))
         if dup_source is None or dup_source == source_file:
             new_items.append((content_hash, conversation))
@@ -1044,13 +1044,18 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
     skipped when nothing new was filed.
     """
     if drawers_filed <= 0:
-        return
+        return None
     try:
         from .hallways import compute_hallways_for_wing
 
-        compute_hallways_for_wing(wing, col=collection, config=config)
+        # Local patch (step 3): compute_hallways_for_wing catches its own fetch error
+        # and returns [], so watch the fetch to report that as a failure too.
+        watched = _FetchWatch(collection) if collection is not None else None
+        compute_hallways_for_wing(wing, col=watched, config=config)
+        return not (watched is not None and watched.failed)
     except Exception as exc:
         print(f"  (hallways skipped: {exc})")
+        return False
 
 
 def _normalize_convo_conversations(
@@ -1181,19 +1186,13 @@ def _mine_convos_impl(
     # 2000-file sweep used to spend >1h just deciding to skip.
     # prefetch_mined_set() does the same decisions in a single scan; loop
     # body becomes an O(1) dict lookup + a cheap local mtime comparison.
-    mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if collection is not None else {}
-    )
     # content_hash -> source_file for transcripts already filed. Repeated
     # exports from Claude/ChatGPT commonly land under a new filename each
     # run even when the conversation itself is unchanged, so the
     # source_file-keyed skip above ("mined_mtimes") never recognizes them —
     # this catches the same conversation reappearing at a new path.
-    mined_content_hashes: dict = (
-        prefetch_content_hashes(collection, extract_mode=extract_mode)
-        if collection is not None
-        else {}
-    )
+    # Local patch (step 3): a one-log save scopes both to that log, see _mine_prefetch.
+    one_log, mined_mtimes, mined_content_hashes = _mine_prefetch(collection, files, extract_mode)
 
     total_drawers = 0
     files_mined = 0
@@ -1245,6 +1244,10 @@ def _mine_convos_impl(
         # hashed the joined bundle. Conversations whose hash is already
         # filed under a different source_file in this wing are dropped;
         # the rest are re-joined and mined as usual.
+        if mined_content_hashes is None:
+            mined_content_hashes = _content_hashes_of(
+                collection, conversations, extract_mode, source_file
+            )
         new_items, duplicates = _split_new_and_duplicate_conversations(
             conversations, wing, source_file, mined_content_hashes
         )
@@ -1351,14 +1354,7 @@ def _mine_convos_impl(
             break
 
     if not dry_run:
-        # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
-        # connection to the Chroma DB, which can invalidate the live collection handle on
-        # some Chroma builds and make the hallway fetch fail.
-        _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
-        if total_drawers > 0:
-            _postmine_mark(palace_path, _hallway_stamp(wing))
-        _validate_palace_fts5_after_mine(palace_path)
-        _postmine_mark(palace_path, "quick_check")
+        _post_mine_steps(palace_path, wing, collection, total_drawers, palace_config, one_log)
 
     _print_convo_summary(files_processed, files_skipped, total_drawers, room_counts)
 
@@ -1417,8 +1413,139 @@ def _print_convo_summary(files_processed, files_skipped, total_drawers, room_cou
 # filed again instead of being skipped as a duplicate.
 #
 # Kill switch: MEMPALACE_CONVO_BOOKMARKS=0. Post-mine throttle (hallways and
-# the SQLite quick_check, fast-path saves only): MEMPALACE_FASTPATH_POSTMINE_SECS
-# (default 1800; 0 = run them on every save, as before).
+# the SQLite quick_check, on bookmark saves and, since step 3, on every one-log
+# save): MEMPALACE_FASTPATH_POSTMINE_SECS (default 1800; 0 = run them on every
+# save, as before).
+#
+# ONE-LOG SAVE — local patch step 3 (2026-10-03). A log the bookmark cannot
+# resume (a one-prompt worker log has no user turn to bookmark) still took the
+# full path, which read every row of the palace twice (mined set, conversation
+# hashes) and rebuilt the wing's hallways: 73 of 81.5 s for a 1.9 MB log on an
+# 84k-row palace. A mine of exactly one file now runs the same upstream prefetch
+# functions over a _ScopedView: the mined set over that file's rows, and, when the
+# file holds ONE conversation (every Claude Code log does), the hashes over the
+# file's own rows plus the rows whose content_hash equals that conversation's hash.
+# A file holding several conversations keeps the whole-palace hash lookup.
+# Known limit: the equality lookup cannot see the hash inside ANOTHER file's
+# comma-joined list (a multi-conversation export), so the log is then filed again
+# instead of skipped as a duplicate. Duplication, never loss: a one-conversation
+# file judged a duplicate is only registered, and none of its drawers is deleted.
+# A throttled hallway rebuild that was skipped is marked pending, and the first
+# save after the window runs it, even a save that files nothing.
+
+
+class _ScopedView:
+    """A collection whose get() returns only the rows matching one ``where`` filter.
+
+    The upstream prefetches page through ``collection.get(limit, offset, include)``
+    while ``offset < collection.count()`` and stop at the first empty page, so over
+    this view they decide exactly what their whole-palace scan decides for the rows
+    the filter keeps. ``count()`` stays the whole-palace count: an upper bound."""
+
+    def __init__(self, collection, where: dict):
+        self._collection = collection
+        self._where = where
+
+    def count(self) -> int:
+        return self._collection.count()
+
+    def get(self, **kwargs):
+        if kwargs.get("where") is not None or kwargs.get("ids") is not None:
+            raise TypeError("_ScopedView.get takes no where or ids of its own")
+        kwargs["where"] = self._where
+        return self._collection.get(**kwargs)
+
+
+class _FetchWatch:
+    """A collection whose get() remembers whether it raised, then re-raises."""
+
+    def __init__(self, collection):
+        self._collection = collection
+        self.failed = False
+
+    def get(self, **kwargs):
+        try:
+            return self._collection.get(**kwargs)
+        except Exception:
+            self.failed = True
+            raise
+
+
+def _mine_prefetch(collection, files, extract_mode: str):
+    """-> (one_log, mined_mtimes, mined_content_hashes). A mine of exactly one file
+    scopes the mined set to that file's rows and returns None for the hashes: the
+    caller fills them after normalizing, from the file's own conversations."""
+    if collection is None:
+        return False, {}, {}
+    if len(files) == 1:
+        scoped = _ScopedView(collection, {"source_file": str(files[0])})
+        return True, prefetch_mined_set(scoped, extract_mode=extract_mode), None
+    return (
+        False,
+        prefetch_mined_set(collection, extract_mode=extract_mode),
+        prefetch_content_hashes(collection, extract_mode=extract_mode),
+    )
+
+
+def _post_mine_steps(palace_path, wing, collection, drawers, palace_config, throttled):
+    """Hallways, then the SQLite quick_check. Throttled (bookmark and one-log saves):
+    each at most once per MEMPALACE_FASTPATH_POSTMINE_SECS.
+
+    Hallways go before the FTS5 validation: the latter opens a direct sqlite
+    connection to the Chroma DB, which can invalidate the live collection handle on
+    some Chroma builds and make the hallway fetch fail."""
+    _hallway_step(palace_path, wing, collection, drawers, palace_config, throttled)
+    if not throttled or _postmine_due(palace_path, "quick_check"):
+        _validate_palace_fts5_after_mine(palace_path)
+        _postmine_mark(palace_path, "quick_check")
+
+
+def _hallway_step(palace_path, wing, collection, drawers, palace_config, throttled):
+    """Rebuild the wing's hallways when this save filed drawers or, throttled, when an
+    earlier save left the rebuild pending. A throttled save inside the window marks
+    the rebuild pending instead; a failed rebuild (it raised, or its collection fetch
+    failed) stays pending."""
+    stamp = _hallway_stamp(wing)
+    pending = _bookmark_dir(palace_path) / f"{stamp}-pending.stamp"
+    if drawers <= 0 and (not throttled or not pending.exists()):
+        return
+    if throttled and not _postmine_due(palace_path, stamp):
+        if drawers > 0:
+            _postmine_mark(palace_path, f"{stamp}-pending")
+        return
+    # Pending work counts as one drawer: the wrapper skips a rebuild of none.
+    ok = _compute_hallways_for_wing_safe(wing, collection, max(drawers, 1), config=palace_config)
+    _postmine_mark(palace_path, stamp)
+    if ok is False:
+        _postmine_mark(palace_path, f"{stamp}-pending")
+        return
+    try:
+        pending.unlink()
+    except OSError:
+        pass
+
+
+def _conversation_hash(conversation: str) -> str:
+    return hashlib.sha256(conversation.strip().encode("utf-8")).hexdigest()
+
+
+def _content_hashes_of(collection, conversations: list, extract_mode: str, source_file: str):
+    """prefetch_content_hashes() for a one-file mine. One conversation: this file's own
+    rows (an older version of it may have stored a comma-joined hash) and the rows
+    whose content_hash equals its hash, in palace order, so the first source seen is
+    the whole-palace one except for the known limit above. Several conversations: the
+    whole palace, as before; one filter value per conversation could pass SQLite's
+    variable limit."""
+    if len(conversations) != 1:
+        return prefetch_content_hashes(collection, extract_mode=extract_mode)
+    where = {
+        "$or": [
+            {"content_hash": _conversation_hash(conversations[0])},
+            {"source_file": source_file},
+        ]
+    }
+    return prefetch_content_hashes(_ScopedView(collection, where), extract_mode=extract_mode)
+
 
 _BOOKMARK_VERSION = 2  # 2: whole-prefix sha256, palace inventory check
 # Bumped whenever chunk_exchanges() can cut the same text differently, so a
@@ -2138,16 +2265,12 @@ def _maybe_fast_path(
     name = Path(files[0]).name
     if fast["status"] == "unchanged":
         print(f"  = [   1/1] {name[:50]:50} unchanged (bookmark)")
+        _hallway_step(palace_path, wing, collection, 0, palace_config, throttled=True)
         _print_convo_summary(1, 1, 0, {})
         return True
     print(f"  + [   1/1] {name[:50]:50} +{fast['drawers']}")
     print(f"    bookmark: read {fast['read'] / 1e6:.1f} of {fast['size'] / 1e6:.1f} MB")
-    if fast["drawers"] > 0 and _postmine_due(palace_path, _hallway_stamp(wing)):
-        _compute_hallways_for_wing_safe(wing, collection, fast["drawers"], config=palace_config)
-        _postmine_mark(palace_path, _hallway_stamp(wing))
-    if _postmine_due(palace_path, "quick_check"):
-        _validate_palace_fts5_after_mine(palace_path)
-        _postmine_mark(palace_path, "quick_check")
+    _post_mine_steps(palace_path, wing, collection, fast["drawers"], palace_config, throttled=True)
     _print_convo_summary(1, 0, fast["drawers"], {fast["room"]: 1} if fast["drawers"] else {})
     return True
 
