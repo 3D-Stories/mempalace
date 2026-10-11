@@ -1721,29 +1721,66 @@ def _spellcheck_active() -> bool:
         return True  # unknown: assume it may rewrite old turns
 
 
+# Bookmarks expecting more drawers than this ask chromadb the four-way $and
+# instead of fetching labels. Labels cost about 0.15 ms a drawer; the $and costs
+# a flat ~2.3 s warm on a 481k-drawer palace. Measured 2026-10-11: crossover near
+# 16k drawers, so 10k keeps the label path well under the $and.
+_INVENTORY_LABEL_FETCH_MAX = 10_000
+
+
 def _inventory_matches(
     collection, bm: dict, source_file: str, wing: str, extract_mode: str
 ) -> bool:
-    """The palace holds exactly the drawers the bookmark expects for this log."""
-    try:
-        got = collection.get(
-            where={
-                "$and": [
-                    {"source_file": source_file},
-                    {"wing": wing},
-                    {"ingest_mode": "convos"},
-                    {"extract_mode": extract_mode},
-                ]
-            },
-            include=[],
-        )
-    except Exception:
-        return False
+    """The palace holds exactly the drawers the bookmark expects for this log.
+
+    Up to ``_INVENTORY_LABEL_FETCH_MAX`` expected drawers, ask by ``source_file``
+    alone and check the other three labels here: as a four-way ``$and``, the
+    near-universal ``wing``/``ingest_mode``/``extract_mode`` clauses cost chromadb
+    seconds per call (7.9 s against 0.19 s, same ids, on 481k drawers), and this
+    runs under the write lock. Larger bookmarks keep the ``$and``, which is the
+    cheaper question there. Both paths check every label.
+
+    Every row of the label path comes back for ``source_file``, so a row whose
+    labels do not say so (missing, padded, unreadable, or a list shorter than
+    the ids) is an answer this cannot read, and any doubt declines to the full
+    path.
+    """
     want = {
         make_convo_drawer_id(wing, bm["room"], source_file, extract_mode, i)
         for i in range(bm["total"])
     }
-    return set(got.get("ids") or []) == want
+    try:
+        if bm["total"] > _INVENTORY_LABEL_FETCH_MAX:
+            got = collection.get(
+                where={
+                    "$and": [
+                        {"source_file": source_file},
+                        {"wing": wing},
+                        {"ingest_mode": "convos"},
+                        {"extract_mode": extract_mode},
+                    ]
+                },
+                include=[],
+            )
+            return set(got.get("ids") or []) == want
+        got = collection.get(where={"source_file": source_file}, include=["metadatas"])
+        ids = list(got.get("ids") or [])
+        metas = list(got.get("metadatas") or [])
+        if len(ids) != len(metas):
+            return False
+        have = set()
+        for drawer_id, meta in zip(ids, metas):
+            if not isinstance(meta, dict) or meta.get("source_file") != source_file:
+                return False
+            if (
+                meta.get("wing") == wing
+                and meta.get("ingest_mode") == "convos"
+                and meta.get("extract_mode") == extract_mode
+            ):
+                have.add(drawer_id)
+    except Exception:
+        return False
+    return have == want
 
 
 def _cc_parse(data: bytes, base_offset: int = 0, seed_tools: Optional[dict] = None) -> dict:
