@@ -538,7 +538,9 @@ def test_g6_bookmark_missing_prefix_ts_falls_back(log, palace, tmp_path, capsys)
         ("room", ""),
         ("tool_map", {"1": 2, 3: "x"}),
         ("total", 10**12),
-        ("size", 600 * 1024 * 1024),
+        # Step 6 lifted the whole-file cap (a size past 500 MB is valid, see
+        # test_convo_large_log_save.py); a resume point past the end still is not.
+        ("resume_offset", 10**15),
     ],
 )
 def test_g6_out_of_range_fields_are_rejected(log, palace, field, value):

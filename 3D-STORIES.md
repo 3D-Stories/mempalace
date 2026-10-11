@@ -25,6 +25,11 @@ release branch. Upstream is [MemPalace/mempalace](https://github.com/MemPalace/m
    `source_file` alone and checks the other three labels in Python, failing closed on any answer
    it cannot read. Bookmarks over 10,000 rows keep the four-way query. It runs under the hub's
    write lock, so every other call waited behind the old 2 to 8 s query.
+6. **Saves of logs over 500 MB:** a save with nothing to mine returns before any palace-wide work.
+   It used to read every drawer's labels and run the quick check, under the hub's write lock: 29
+   to 44 minutes at 706,000 drawers. A log over the 500 MB full-read cap keeps resuming from its
+   bookmark, holding at most 500 MB of new bytes in memory. It is never read whole, and its
+   bookmark is never dropped.
 
 Each commit carries its own tests under `tests/`. Measured numbers and the reasons for each step
 are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md`.
@@ -32,7 +37,7 @@ are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md
 ## Install on the hub
 
 ```bash
-pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-2'
+pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-3'
 ```
 
 Pin the dependencies to the versions already installed, so a reinstall cannot move ChromaDB under
@@ -48,5 +53,5 @@ the palace. Restart `mempalace-hub` afterwards, only when no mine is running.
 
 ## Sending fixes upstream
 
-Steps 2 to 5 are this fork's own work. Each can go upstream as a pull request from a branch cut off
+Steps 2 to 6 are this fork's own work. Each can go upstream as a pull request from a branch cut off
 upstream `develop`. Step 1 is already upstream as PR #2408.
