@@ -191,3 +191,82 @@ def test_dry_run_of_an_oversize_log_does_nothing(log, palace, tmp_path, watch, m
     mine_convos(log.path, palace, wing=WING, dry_run=True)
     assert watch == []
     assert _snapshot(palace) == before
+
+
+# ── Review F1 (GPT-6.1 Sol, 2026-10-11): opening the palace is palace-wide work too ──
+
+
+@pytest.fixture
+def no_open(monkeypatch):
+    """Fail the test if a save opens the palace collection at all."""
+
+    def refuse(*a, **k):
+        raise AssertionError("the save opened the palace collection")
+
+    monkeypatch.setattr(convo_miner, "_open_convo_collection", refuse)
+
+
+def test_empty_directory_save_does_not_open_the_palace(palace, tmp_path, no_open):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    mine_convos(str(empty), palace, wing=WING)
+
+
+def test_oversize_log_without_bookmark_does_not_open_the_palace(log, palace, monkeypatch, no_open):
+    _cap_at(monkeypatch, os.path.getsize(log.path) - 1)
+    mine_convos(log.path, palace, wing=WING)
+
+
+def test_oversize_dry_run_does_not_open_the_palace(log, palace, monkeypatch):
+    mine_convos(log.path, palace, wing=WING)
+    _cap_at(monkeypatch, os.path.getsize(log.path))
+    log.grow(100, 4)
+    monkeypatch.setattr(
+        convo_miner,
+        "_open_convo_collection",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("opened the palace")),
+    )
+    mine_convos(log.path, palace, wing=WING, dry_run=True)
+
+
+def test_directory_holding_only_an_oversize_log_does_no_work(
+    log, palace, tmp_path, watch, monkeypatch, capsys
+):
+    mine_convos(log.path, palace, wing=WING)
+    before = _snapshot(palace)
+    bm_path = _bookmark_path(palace, log.path, "exchange", WING)
+    _cap_at(monkeypatch, os.path.getsize(log.path))
+    log.grow(100, 4)
+    monkeypatch.setattr(
+        convo_miner,
+        "_open_convo_collection",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("opened the palace")),
+    )
+    watch.clear()
+    mine_convos(os.path.dirname(log.path), palace, wing=WING)
+    assert watch == []
+    assert _snapshot(palace) == before
+    assert bm_path.exists()
+
+
+def test_oversize_log_with_bookmarks_switched_off_is_skipped_and_keeps_its_bookmark(
+    log, palace, watch, monkeypatch, capsys
+):
+    mine_convos(log.path, palace, wing=WING)
+    before = _snapshot(palace)
+    bm_path = _bookmark_path(palace, log.path, "exchange", WING)
+    _cap_at(monkeypatch, os.path.getsize(log.path))
+    log.grow(100, 4)
+    monkeypatch.setenv("MEMPALACE_CONVO_BOOKMARKS", "0")
+    monkeypatch.setattr(
+        convo_miner,
+        "_open_convo_collection",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("opened the palace")),
+    )
+    watch.clear()
+    capsys.readouterr()
+    mine_convos(log.path, palace, wing=WING)
+    assert watch == []
+    assert _snapshot(palace) == before
+    assert bm_path.exists()
+    assert "no usable bookmark" in capsys.readouterr().err

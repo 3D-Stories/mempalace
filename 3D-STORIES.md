@@ -25,11 +25,14 @@ release branch. Upstream is [MemPalace/mempalace](https://github.com/MemPalace/m
    `source_file` alone and checks the other three labels in Python, failing closed on any answer
    it cannot read. Bookmarks over 10,000 rows keep the four-way query. It runs under the hub's
    write lock, so every other call waited behind the old 2 to 8 s query.
-6. **Saves of logs over 500 MB:** a save with nothing to mine returns before any palace-wide work.
-   It used to read every drawer's labels and run the quick check, under the hub's write lock: 29
-   to 44 minutes at 706,000 drawers. A log over the 500 MB full-read cap keeps resuming from its
-   bookmark, holding at most 500 MB of new bytes in memory. It is never read whole, and its
-   bookmark is never dropped.
+6. **Saves of logs over 500 MB:** a save with nothing to mine returns before any palace-wide work,
+   without even opening the palace. It used to read every drawer's labels and run the quick
+   check, under the hub's write lock: 29 to 44 minutes at 706,000 drawers. A log already over the
+   500 MB full-read cap when a save starts keeps resuming from its bookmark. A resume reads at
+   most 500 MB after the bookmark; that bounds the input, not peak memory, which can be about
+   twice that or more. Such a log is never read whole, and a declined resume keeps its bookmark.
+   Not fixed here: a log that crosses the cap during a full-path save can still lose its
+   bookmark, as before this step.
 
 Each commit carries its own tests under `tests/`. Measured numbers and the reasons for each step
 are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md`.

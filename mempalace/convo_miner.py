@@ -1161,14 +1161,9 @@ def _mine_convos_impl(
         print("  DRY RUN -- nothing will be filed")
     print(f"{'-' * 55}\n")
 
-    collection = _open_convo_collection(
-        palace_path,
-        dry_run=dry_run,
-    )
-
-    # Local patch (step 6): also returns at once when the scan found nothing to mine.
-    if _mine_before_full_read(
-        collection,
+    # Local patch (step 6): opens the collection only when there is something to mine,
+    # and returns at once when there is not.
+    handled, collection = _mine_before_full_read(
         files,
         convo_dir,
         include_subagents,
@@ -1180,7 +1175,8 @@ def _mine_convos_impl(
         cfg_chunk_size,
         cfg_min_chunk_size,
         palace_config,
-    ):
+    )
+    if handled:
         return
 
     # Bulk pre-fetch already-mined source_file -> stored mtime in one
@@ -1363,24 +1359,38 @@ def _mine_convos_impl(
 
 
 def _mine_before_full_read(
-    collection, files, convo_dir, include_subagents, palace_path, wing, agent, extract_mode, *rest
-) -> bool:
-    """True when the save is finished without the full path's palace-wide prefetch:
-    the bookmark fast path handled it, or (local patch, step 6) the scan found nothing
-    to mine. An empty save used to read every drawer's labels (_mine_prefetch) and run
-    the unthrottled quick_check while holding the palace write lock: 29-44 minutes on
-    the live hub at 706k drawers (2026-10-11).
+    files, convo_dir, include_subagents, palace_path, wing, agent, extract_mode, dry_run, *rest
+) -> tuple:
+    """Local patch (step 6). ``(handled, collection)``: ``handled`` is True when the save
+    is finished without the full path's palace-wide prefetch, because the bookmark fast
+    path handled it or the scan found nothing to mine.
 
-    A single log the scan dropped only for its size may still resume from its
-    bookmark. It is never read whole, and never reaches _bookmark_snapshot, which would
-    drop the bookmark that is its only way back in."""
+    The collection is opened only when there is something to mine: opening it can itself
+    be palace-wide work. An empty save used to read every drawer's labels
+    (_mine_prefetch) and run the unthrottled quick_check while holding the palace write
+    lock: 29-44 minutes on the live hub at 706k drawers (2026-10-11).
+
+    A single log the scan dropped only for its size may still resume from its bookmark.
+    It is never read whole, and never reaches _bookmark_snapshot, which would drop the
+    bookmark that is its only way back in."""
     if files:
-        return _maybe_fast_path(collection, files, palace_path, wing, agent, extract_mode, *rest)
+        collection = _open_convo_collection(palace_path, dry_run=dry_run)
+        handled = _maybe_fast_path(
+            collection, files, palace_path, wing, agent, extract_mode, dry_run, *rest
+        )
+        return handled, collection
     oversize = _oversize_single_log(convo_dir, include_subagents)
-    if oversize and _maybe_fast_path(
-        collection, oversize, palace_path, wing, agent, extract_mode, *rest
-    ):
-        return True
+    resumable = (
+        bool(oversize)
+        and _bookmark_eligible(oversize[0], 1, extract_mode, dry_run)
+        and _bookmark_path(palace_path, str(oversize[0]), extract_mode, wing).is_file()
+    )
+    if resumable:
+        collection = _open_convo_collection(palace_path, dry_run=dry_run)
+        if _maybe_fast_path(
+            collection, oversize, palace_path, wing, agent, extract_mode, dry_run, *rest
+        ):
+            return True, collection
     if oversize:
         print(
             f"  SKIP: {oversize[0].name} is over the {MAX_FILE_SIZE // (1024 * 1024)} MB"
@@ -1388,7 +1398,7 @@ def _mine_before_full_read(
             file=sys.stderr,
         )
     _print_convo_summary(0, 0, 0, {})
-    return True
+    return True, None
 
 
 def _oversize_single_log(convo_dir: str, include_subagents: bool) -> list:
@@ -1600,9 +1610,11 @@ _CHUNK_RECIPE = "exchange-no-dash-break-1"
 _HASH_BLOCK = 8 * 1024 * 1024
 _BOOKMARK_MAX_FILE = 500 * 1024 * 1024  # normalize._read_transcript_file's cap
 # Local patch (step 6): the quick path streams the prefix through sha256 in
-# _HASH_BLOCK pieces and holds only the bytes after the bookmark, so the whole-file
-# cap above binds only the full path (which writes the first bookmark). This caps
-# what a resume holds in memory instead, at the same 500 MB.
+# _HASH_BLOCK pieces and keeps only the bytes from resume_offset to the end (the
+# replayed last exchange included), so the whole-file cap above binds only the full
+# path, which writes the first bookmark. This caps those kept bytes instead, at the
+# same 500 MB. It bounds the input, not peak memory: _hash_through holds the blocks and
+# their join at once, and parsing builds text and chunks on top (about 2x or more).
 _BOOKMARK_MAX_TAIL = 500 * 1024 * 1024
 _POSTMINE_THROTTLE_ENV = "MEMPALACE_FASTPATH_POSTMINE_SECS"
 _POSTMINE_THROTTLE_DEFAULT = 1800.0
