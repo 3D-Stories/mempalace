@@ -33,6 +33,13 @@ release branch. Upstream is [MemPalace/mempalace](https://github.com/MemPalace/m
    twice that or more. Such a log is never read whole, and a declined resume keeps its bookmark.
    Not fixed here: a log that crosses the cap during a full-path save can still lose its
    bookmark, as before this step.
+7. **Search shows each text once:** hits with identical text collapse to the best-ranked one,
+   whatever chat they came from, before the top-N cut, so the cut fills from the rest of the
+   ranked pool. The kept hit gains `also_in`: how many other chats among the candidates hold the
+   text, and the first three of them. It covers the vector and union searches and the
+   vector-disabled keyword fallback; the command-line `search` is unchanged, since it fetches only
+   the requested count. `MEMPALACE_SEARCH_COLLAPSE=0` turns it off. 30.7% of the hub's drawers
+   were exact copies, and one search returned the same text in 4 of its top 10 slots.
 
 Each commit carries its own tests under `tests/`. Measured numbers and the reasons for each step
 are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md`.
@@ -40,7 +47,7 @@ are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md
 ## Install on the hub
 
 ```bash
-pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-3'
+pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-4'
 ```
 
 Pin the dependencies to the versions already installed, so a reinstall cannot move ChromaDB under
@@ -56,5 +63,5 @@ the palace. Restart `mempalace-hub` afterwards, only when no mine is running.
 
 ## Sending fixes upstream
 
-Steps 2 to 6 are this fork's own work. Each can go upstream as a pull request from a branch cut off
+Steps 2 to 7 are this fork's own work. Each can go upstream as a pull request from a branch cut off
 upstream `develop`. Step 1 is already upstream as PR #2408.
