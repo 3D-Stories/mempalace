@@ -185,7 +185,7 @@ def _path_within_root(path: Path, root: Path) -> bool:
         return False
 
 
-def _is_regular_source_file(filepath: Path, root: Path) -> bool:
+def _is_regular_source_file(filepath: Path, root: Path, *, size_cap: bool = True) -> bool:
     if not _path_within_root(filepath, root):
         return False
     # O_NONBLOCK keeps the S_ISREG verdict below reachable: a blocking open
@@ -203,7 +203,7 @@ def _is_regular_source_file(filepath: Path, root: Path) -> bool:
                 raise
             fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
-        return stat.S_ISREG(st.st_mode) and st.st_size <= MAX_FILE_SIZE
+        return stat.S_ISREG(st.st_mode) and (not size_cap or st.st_size <= MAX_FILE_SIZE)
     except OSError:
         return False
     finally:
@@ -514,7 +514,7 @@ def detect_convo_room(content: str) -> str:
 # =============================================================================
 
 
-def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
+def scan_convos(convo_dir: str, include_subagents: bool = False, *, size_cap: bool = True) -> list:
     """Find all potential conversation files.
 
     Skips symlinks and oversized files. Each skipped symlink is logged to
@@ -575,7 +575,7 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                         )
                         continue
                     file_size = file_stat.st_size
-                    if file_size > MAX_FILE_SIZE:
+                    if size_cap and file_size > MAX_FILE_SIZE:
                         print(
                             f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
                             f" exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit",
@@ -591,7 +591,7 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                         file=sys.stderr,
                     )
                     continue
-                if not _is_regular_source_file(filepath, convo_path):
+                if not _is_regular_source_file(filepath, convo_path, size_cap=size_cap):
                     continue
                 files.append(filepath)
     return files
@@ -1161,14 +1161,12 @@ def _mine_convos_impl(
         print("  DRY RUN -- nothing will be filed")
     print(f"{'-' * 55}\n")
 
-    collection = _open_convo_collection(
-        palace_path,
-        dry_run=dry_run,
-    )
-
-    if _maybe_fast_path(
-        collection,
+    # Local patch (step 6): opens the collection only when there is something to mine,
+    # and returns at once when there is not.
+    handled, collection = _mine_before_full_read(
         files,
+        convo_dir,
+        include_subagents,
         palace_path,
         wing,
         agent,
@@ -1177,7 +1175,8 @@ def _mine_convos_impl(
         cfg_chunk_size,
         cfg_min_chunk_size,
         palace_config,
-    ):
+    )
+    if handled:
         return
 
     # Bulk pre-fetch already-mined source_file -> stored mtime in one
@@ -1357,6 +1356,63 @@ def _mine_convos_impl(
         _post_mine_steps(palace_path, wing, collection, total_drawers, palace_config, one_log)
 
     _print_convo_summary(files_processed, files_skipped, total_drawers, room_counts)
+
+
+def _mine_before_full_read(
+    files, convo_dir, include_subagents, palace_path, wing, agent, extract_mode, dry_run, *rest
+) -> tuple:
+    """Local patch (step 6). ``(handled, collection)``: ``handled`` is True when the save
+    is finished without the full path's palace-wide prefetch, because the bookmark fast
+    path handled it or the scan found nothing to mine.
+
+    The collection is opened only when there is something to mine: opening it can itself
+    be palace-wide work. An empty save used to read every drawer's labels
+    (_mine_prefetch) and run the unthrottled quick_check while holding the palace write
+    lock: 29-44 minutes on the live hub at 706k drawers (2026-10-11).
+
+    A single log the scan dropped only for its size may still resume from its bookmark.
+    It is never read whole, and never reaches _bookmark_snapshot, which would drop the
+    bookmark that is its only way back in."""
+    if files:
+        collection = _open_convo_collection(palace_path, dry_run=dry_run)
+        handled = _maybe_fast_path(
+            collection, files, palace_path, wing, agent, extract_mode, dry_run, *rest
+        )
+        return handled, collection
+    oversize = _oversize_single_log(convo_dir, include_subagents)
+    resumable = (
+        bool(oversize)
+        and _bookmark_eligible(oversize[0], 1, extract_mode, dry_run)
+        and _bookmark_path(palace_path, str(oversize[0]), extract_mode, wing).is_file()
+    )
+    if resumable:
+        collection = _open_convo_collection(palace_path, dry_run=dry_run)
+        if _maybe_fast_path(
+            collection, oversize, palace_path, wing, agent, extract_mode, dry_run, *rest
+        ):
+            return True, collection
+    if oversize:
+        print(
+            f"  SKIP: {oversize[0].name} is over the {MAX_FILE_SIZE // (1024 * 1024)} MB"
+            " full-read cap and has no usable bookmark",
+            file=sys.stderr,
+        )
+    _print_convo_summary(0, 0, 0, {})
+    return True, None
+
+
+def _oversize_single_log(convo_dir: str, include_subagents: bool) -> list:
+    """Local patch (step 6): ``[path]`` when ``convo_dir`` names one conversation file
+    that the scan dropped only because it is over MAX_FILE_SIZE, else ``[]``."""
+    requested = Path(convo_dir).expanduser()
+    try:
+        if requested.is_symlink() or not requested.is_file():
+            return []
+        if requested.stat().st_size <= MAX_FILE_SIZE:
+            return []
+    except OSError:
+        return []
+    return scan_convos(convo_dir, include_subagents=include_subagents, size_cap=False)
 
 
 def _print_convo_summary(files_processed, files_skipped, total_drawers, room_counts) -> None:
@@ -1553,6 +1609,13 @@ _BOOKMARK_VERSION = 2  # 2: whole-prefix sha256, palace inventory check
 _CHUNK_RECIPE = "exchange-no-dash-break-1"
 _HASH_BLOCK = 8 * 1024 * 1024
 _BOOKMARK_MAX_FILE = 500 * 1024 * 1024  # normalize._read_transcript_file's cap
+# Local patch (step 6): the quick path streams the prefix through sha256 in
+# _HASH_BLOCK pieces and keeps only the bytes from resume_offset to the end (the
+# replayed last exchange included), so the whole-file cap above binds only the full
+# path, which writes the first bookmark. This caps those kept bytes instead, at the
+# same 500 MB. It bounds the input, not peak memory: _hash_through holds the blocks and
+# their join at once, and parsing builds text and chunks on top (about 2x or more).
+_BOOKMARK_MAX_TAIL = 500 * 1024 * 1024
 _POSTMINE_THROTTLE_ENV = "MEMPALACE_FASTPATH_POSTMINE_SECS"
 _POSTMINE_THROTTLE_DEFAULT = 1800.0
 
@@ -1633,7 +1696,7 @@ def _bookmark_valid(bm) -> bool:
         and bm["normalize_version"] >= 1
         and bm["chunk_size"] > 0
         and bm["min_chunk_size"] >= 0
-        and 0 < bm["resume_offset"] <= bm["size"] <= _BOOKMARK_MAX_FILE
+        and 0 < bm["resume_offset"] <= bm["size"]
         and 1 <= bm["base"] < bm["total"] <= bm["size"]  # every chunk takes at least one byte
         and _is_hex64(bm["prefix_sha"])
         and _is_hex64(bm["prev_hash"])
@@ -2107,8 +2170,10 @@ def _fast_path_locked(
         size = st.st_size
         if size < bm["size"]:
             raise _FastPathDecline("the log shrank")
-        if size > _BOOKMARK_MAX_FILE:
-            raise _FastPathDecline("the log passed the 500 MB cap")
+        if size - bm["resume_offset"] > _BOOKMARK_MAX_TAIL:
+            raise _FastPathDecline(
+                f"the new part passed the {_BOOKMARK_MAX_TAIL // (1024 * 1024)} MB cap"
+            )
         old_sha, new_sha, tail = _hash_through(fh, bm["size"], size, bm["resume_offset"])
     if old_sha != bm["prefix_sha"]:
         raise _FastPathDecline("bytes before the bookmark changed")
