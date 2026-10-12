@@ -33,6 +33,20 @@ release branch. Upstream is [MemPalace/mempalace](https://github.com/MemPalace/m
    twice that or more. Such a log is never read whole, and a declined resume keeps its bookmark.
    Not fixed here: a log that crosses the cap during a full-path save can still lose its
    bookmark, as before this step.
+8. **Saves skip boilerplate and same-chat repeats:** a chat save does not store a piece that
+   starts with one of five fixed markers (`<herdr_model_guidance`, `<local-command-caveat>`,
+   `<local-command-stdout>`, `<command-message>`, `Base directory for this skill:`), a piece whose
+   SHA-256 is on the reviewed list `<config dir>/boilerplate.json`, or a piece whose text an
+   earlier piece of the same chat already holds; the first copy is kept. Pieces keep their numbers,
+   so a skipped piece only leaves a gap. A chat whose every piece would be skipped keeps its first
+   piece and gets no bookmark. The bookmark lists its skipped pieces, and a bookmark save decides
+   the new pieces against the pieces this chat stores before the bookmark, so it stores exactly
+   what a full read would. Each row also carries `chunk_skipped`, and the "already saved?" checks
+   count stored plus skipped. Holding the same text as another chat never makes a piece skipped;
+   only boilerplate is skipped across chats. A missing or
+   malformed list means no listed texts. `MEMPALACE_SAVE_DEDUPE=0` stores every piece again.
+   Measured on a copy of the hub's palace (707,738 rows): 130,294 rows (18.4%) were repeats
+   inside the same chat, and 40,925 (5.8%) were boilerplate.
 
 Each commit carries its own tests under `tests/`. Measured numbers and the reasons for each step
 are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md`.
@@ -56,5 +70,5 @@ the palace. Restart `mempalace-hub` afterwards, only when no mine is running.
 
 ## Sending fixes upstream
 
-Steps 2 to 6 are this fork's own work. Each can go upstream as a pull request from a branch cut off
+Steps 2 to 8 are this fork's own work. Each can go upstream as a pull request from a branch cut off
 upstream `develop`. Step 1 is already upstream as PR #2408.

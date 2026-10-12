@@ -116,7 +116,7 @@ def file_already_mined(
                     return True
                 seen = group_counts.get(stored_mtime, 0) + 1
                 group_counts[stored_mtime] = seen
-                if seen >= chunk_total:
+                if seen >= _stored_target(chunk_total, meta.get("chunk_skipped")):
                     return True
             if not ids:
                 break
@@ -183,7 +183,7 @@ def prefetch_mined_set(
                 stored_mtime = meta.get("source_mtime")
                 mtime_key = float(stored_mtime) if stored_mtime is not None else None
                 entry = groups.setdefault(src, {}).setdefault(
-                    mtime_key, {"count": 0, "chunk_total": None}
+                    mtime_key, {"count": 0, "chunk_total": None, "chunk_skipped": None}
                 )
                 entry["count"] += 1
                 chunk_total = meta.get("chunk_total")
@@ -192,6 +192,7 @@ def prefetch_mined_set(
                         entry["chunk_total"] = int(chunk_total)
                     except (TypeError, ValueError):
                         pass
+                entry["chunk_skipped"] = meta.get("chunk_skipped")
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
@@ -206,10 +207,29 @@ def prefetch_mined_set(
                 # Legacy / registry: no completion marker — trust membership.
                 mined[src] = mtime_key
                 break
-            if entry["count"] >= chunk_total:
+            if entry["count"] >= _stored_target(chunk_total, entry["chunk_skipped"]):
                 mined[src] = mtime_key
                 break
     return mined
+
+
+def _stored_target(chunk_total, chunk_skipped):
+    """Rows a complete save stores: ``chunk_total`` less a well-formed ``chunk_skipped``.
+
+    3D-Stories fork (sysop#297): a chat save skips boilerplate and same-chat
+    repeats, so a complete save holds ``chunk_total - chunk_skipped`` rows.
+    Anything but a plain int in ``[0, chunk_total)`` counts as no skips, so a
+    malformed label can never call a short save complete.
+    """
+    if (
+        isinstance(chunk_total, bool)
+        or not isinstance(chunk_total, int)
+        or isinstance(chunk_skipped, bool)
+        or not isinstance(chunk_skipped, int)
+        or not 0 <= chunk_skipped < chunk_total
+    ):
+        return chunk_total
+    return chunk_total - chunk_skipped
 
 
 def prefetch_content_hashes(

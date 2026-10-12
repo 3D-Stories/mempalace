@@ -23,6 +23,9 @@ VOLATILE = {
     "last_modified",
     "source_mtime",
     "chunk_total",
+    # 3D-Stories fork (sysop#297): chunk_total's twin. A row before the bookmark
+    # keeps the pair its own save wrote; test_convo_save_dedupe checks the pairs.
+    "chunk_skipped",
     "content_hash",
     "authored_at",
 }
