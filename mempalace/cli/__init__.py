@@ -90,6 +90,7 @@ _FRAGMENTS = (
     "cmd_update.py",
     "cmd_coord.py",
     "cmd_repair.py",
+    "cmd_dedupe.py",
     "cmd_serve.py",
     "parser.py",
 )
