@@ -88,7 +88,7 @@ are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md
 ## Install on the hub
 
 ```bash
-pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-4'
+pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-5'
 ```
 
 Pin the dependencies to the versions already installed, so a reinstall cannot move ChromaDB under
