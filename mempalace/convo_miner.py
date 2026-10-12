@@ -32,6 +32,7 @@ from .ids import (
 )
 from .normalize import UnparsedCodexTranscriptError, normalize_conversations
 from .entities import entities_metadata
+from .save_dedupe import plan_skips, save_dedupe_enabled
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -649,6 +650,7 @@ def _convo_drawer_meta(
     chunk_hash,
     source_mtime,
     content_hash,
+    chunk_skipped=0,
 ) -> dict:
     """Metadata for a new or changed convo drawer (shared by the full and bookmark paths)."""
     meta = {
@@ -670,11 +672,17 @@ def _convo_drawer_meta(
     }
     if source_mtime is not None:
         meta["source_mtime"] = source_mtime
-    # Stamp content_hash only on chunk 0 so multi-conversation
-    # privacy-export hashes are not O(N²)-duplicated across every
-    # chunk row. ``prefetch_content_hashes`` still finds them — it
-    # scans all drawers and splits comma-joined hash fields.
-    if content_hash is not None and chunk.get("chunk_index", 0) == 0:
+    # 3D-Stories fork (sysop#297): how many of this save's chunk_total pieces
+    # were skipped, so the completion checks count stored + skipped. Written
+    # even when 0: chromadb merges metadata on upsert, so an omitted key would
+    # keep a previous save's count.
+    meta["chunk_skipped"] = chunk_skipped
+    # Callers pass content_hash only for the first STORED piece (chunk 0
+    # unless the save skipped it) so multi-conversation privacy-export hashes
+    # are not O(N²)-duplicated across every chunk row.
+    # ``prefetch_content_hashes`` still finds them — it scans all drawers and
+    # splits comma-joined hash fields.
+    if content_hash is not None:
         meta["content_hash"] = content_hash
     return meta
 
@@ -715,8 +723,15 @@ def _file_chunks_locked(
     extract_mode,
     authored_at=None,
     content_hash=None,
+    skip=frozenset(),
 ):
     """Lock the source file and file its chunks incrementally.
+
+    ``skip`` holds the chunk_index values this save does not store (3D-Stories
+    fork, sysop#297: boilerplate and same-chat repeats). They keep their
+    numbers, are never written, and an old drawer at one of them is deleted with
+    the other orphans; every stored drawer carries ``chunk_skipped`` so the
+    completion checks count stored + skipped.
 
     Combines the per-file serialization that prevents concurrent agents from
     duplicating work (via mine_lock) with an incremental re-mine contract
@@ -783,6 +798,10 @@ def _file_chunks_locked(
         except OSError:
             source_mtime = None
         chunk_total = len(chunks)
+        chunk_skipped = len(skip)
+        first_stored = min(
+            (c["chunk_index"] for c in chunks if c["chunk_index"] not in skip), default=None
+        )
 
         # Partition the target set: a chunk whose drawer already exists with
         # the same content hash at the current schema keeps its embedding and
@@ -793,9 +812,12 @@ def _file_chunks_locked(
         to_touch: list = []  # (drawer_id, refreshed_meta)
         new_ids: set = set()
         for chunk in chunks:
+            if chunk["chunk_index"] in skip:
+                continue
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
                 room_counts_delta[chunk_room] += 1
+            chunk_content_hash = content_hash if chunk["chunk_index"] == first_stored else None
             drawer_id = make_convo_drawer_id(
                 wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
             )
@@ -809,16 +831,21 @@ def _file_chunks_locked(
             ):
                 touched = dict(prev)
                 touched["chunk_total"] = chunk_total
+                touched["chunk_skipped"] = chunk_skipped
                 if source_mtime is not None:
                     touched["source_mtime"] = source_mtime
                 else:
                     # A stale stored mtime with no current one to replace it
                     # would let an old group satisfy a future completion check.
                     touched.pop("source_mtime", None)
-                # Refresh the chunk-0 conversation-hash stamp so cross-file
-                # dedup keeps seeing conversations added since the last pass.
-                if content_hash is not None and chunk.get("chunk_index", 0) == 0:
-                    touched["content_hash"] = content_hash
+                # Refresh the conversation-hash stamp on the first stored piece
+                # so cross-file dedup keeps seeing conversations added since the
+                # last pass; no other piece keeps one. Blanked, not dropped:
+                # chromadb's metadata merge would keep a dropped key.
+                if chunk_content_hash is not None:
+                    touched["content_hash"] = chunk_content_hash
+                elif touched.get("content_hash"):
+                    touched["content_hash"] = ""
                 to_touch.append((drawer_id, touched))
                 continue
             meta = _convo_drawer_meta(
@@ -833,8 +860,11 @@ def _file_chunks_locked(
                 chunk_total=chunk_total,
                 chunk_hash=chunk_hash,
                 source_mtime=source_mtime,
-                content_hash=content_hash,
+                content_hash=chunk_content_hash,
+                chunk_skipped=chunk_skipped,
             )
+            if chunk_content_hash is None and prev is not None and prev.get("content_hash"):
+                meta["content_hash"] = ""  # the upsert merges; blank an old stamp
             to_upsert.append((drawer_id, chunk["content"], meta))
 
         # Batch into bounded requests so large transcripts keep most of the
@@ -1119,6 +1149,20 @@ def _open_convo_collection(
         return None
 
 
+def _plan_file_skips(chunks: list, *, conversations: int):
+    """Pieces a full read of one file does not store, and whether keep-one fired.
+
+    3D-Stories fork (sysop#297): boilerplate and same-chat repeats, decided once
+    from the text alone so the save and its bookmark agree. Only for a file that
+    holds one conversation: the pieces of several (a privacy export) are joined
+    before chunking, so a "repeat" there could be another conversation's copy.
+    """
+    if conversations != 1:
+        return frozenset(), False
+    positions, keep_one_fired = plan_skips(c["content"] for c in chunks)
+    return frozenset(chunks[p]["chunk_index"] for p in positions), keep_one_fired
+
+
 def _mine_convos_impl(
     convo_dir: str,
     palace_path: str,
@@ -1312,6 +1356,8 @@ def _mine_convos_impl(
         if extract_mode != "general":
             room_counts[room] += 1
 
+        skip, keep_one_fired = _plan_file_skips(chunks, conversations=len(new_items))
+
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped = _file_chunks_locked(
@@ -1324,6 +1370,7 @@ def _mine_convos_impl(
             extract_mode,
             authored_at=_extract_authored_at(filepath),
             content_hash=content_hash,
+            skip=skip,
         )
         if skipped:
             files_skipped += 1
@@ -1340,6 +1387,8 @@ def _mine_convos_impl(
             snap=bm_snap,
             chunk_size=cfg_chunk_size,
             min_chunk_size=cfg_min_chunk_size,
+            skip=skip,
+            keep_one_fired=keep_one_fired,
         )
         for r, n in room_delta.items():
             room_counts[r] += n
@@ -1624,6 +1673,13 @@ class _FastPathDecline(Exception):
     """The fast path cannot prove it matches the full path; use the full path."""
 
 
+class _PriorRowCapExceeded(_FastPathDecline):
+    """The prior-text lookup passed ``_PRIOR_ROW_CAP``. A bookmark save then stores the
+    new pieces without the repeat check against earlier pieces, rather than decline
+    (3D-Stories fork, sysop#297): a chat over the 500 MB cap has no full path, so a
+    decline would save nothing."""
+
+
 def _bookmarks_enabled() -> bool:
     flag = os.environ.get("MEMPALACE_CONVO_BOOKMARKS", "1").strip().lower()
     return flag not in ("0", "false", "no", "off")
@@ -1689,7 +1745,7 @@ def _bookmark_valid(bm) -> bool:
         return False
     if not all(isinstance(k, str) and isinstance(v, str) for k, v in bm["tool_map"].items()):
         return False
-    return (
+    if not (
         math.isfinite(bm["mtime"])
         and bm["dev"] >= 0
         and bm["ino"] >= 0
@@ -1700,7 +1756,121 @@ def _bookmark_valid(bm) -> bool:
         and 1 <= bm["base"] < bm["total"] <= bm["size"]  # every chunk takes at least one byte
         and _is_hex64(bm["prefix_sha"])
         and _is_hex64(bm["prev_hash"])
-    )
+    ):
+        return False
+    return _skipped_valid(bm)
+
+
+def _skipped_valid(bm: dict) -> bool:
+    """3D-Stories fork (sysop#297): ``skipped`` lists the piece numbers the chat's
+    saves left out, strictly increasing, each below ``total``, and at least one
+    piece before ``base`` is stored (the anchor). A bookmark written before this
+    field existed has none, which means nothing was skipped."""
+    skipped = bm.get("skipped", [])
+    if not isinstance(skipped, list) or not all(
+        isinstance(i, int) and not isinstance(i, bool) for i in skipped
+    ):
+        return False
+    if any(b <= a for a, b in zip(skipped, skipped[1:])):
+        return False
+    if skipped and not (skipped[0] >= 0 and skipped[-1] < bm["total"]):
+        return False
+    return sum(1 for i in skipped if i < bm["base"]) < bm["base"]
+
+
+def _bookmark_skipped(bm: dict) -> frozenset:
+    return frozenset(bm.get("skipped", ()))
+
+
+def _anchor_index(base: int, skipped) -> Optional[int]:
+    """The last stored piece before ``base``, or None when every one was skipped."""
+    for i in range(base - 1, -1, -1):
+        if i not in skipped:
+            return i
+    return None
+
+
+_PRIOR_HASH_BATCH = 200
+# Rows one batch may accept. A chat saved before step 8 can hold many copies of
+# one text; past this many, the lookup stops rather than read them all under
+# the palace lock, and the bookmark save skips its repeat check.
+_PRIOR_ROW_CAP = 10_000
+
+
+def _stored_prior_hashes(
+    collection, contents, source_file, wing, room, extract_mode, base, skipped
+) -> frozenset:
+    """Fingerprints of ``contents`` that this chat already stores before ``base``.
+
+    3D-Stories fork (sysop#297): a full read skips a piece whose text an earlier
+    piece of the same chat holds. Under an unchanged boilerplate list and
+    switch, the pieces before a bookmark written by this code that are still
+    stored are the first copies a full read would have seen there, unless an
+    earlier save passed the cap (``_PriorRowCapExceeded``) and kept repeats.
+    So the bookmark save asks the palace for those, and only for the new
+    pieces' texts. It asks by this chat's ``source_file`` and ``chunk_hash`` together,
+    for at most ``_PRIOR_ROW_CAP`` + 1 rows per batch: the extra row shows the
+    cap was passed, and then it raises ``_PriorRowCapExceeded``. On a copy of the
+    hub's palace (2026-10-11, 4,196 chats) the worst 200-text batch any chat
+    holds returned 6,069 rows in 4.9 s on the first timed call and 1.0 s on
+    later ones, and the largest chat's 2,962 rows in 0.7 s. It checks the drawer
+    id and piece number here, and then the stored text of the one row per
+    fingerprint it relies on. Any other doubt declines the bookmark save rather
+    than store a repeat or skip a first copy: a chat under the 500 MB cap then
+    takes the full read, and one over it skips this save and keeps its
+    bookmark.
+    """
+    wanted = sorted({hashlib.sha256(c.encode("utf-8")).hexdigest() for c in contents})
+    candidates: dict = {}  # fingerprint -> (chunk_index, drawer_id), the earliest one
+    try:
+        for start in range(0, len(wanted), _PRIOR_HASH_BATCH):
+            batch = wanted[start : start + _PRIOR_HASH_BATCH]
+            got = collection.get(
+                where={"$and": [{"source_file": source_file}, {"chunk_hash": {"$in": batch}}]},
+                include=["metadatas"],
+                limit=_PRIOR_ROW_CAP + 1,
+            )
+            ids = list(got.get("ids") or [])
+            metas = list(got.get("metadatas") or [])
+            if len(ids) != len(metas):
+                raise _FastPathDecline("unreadable answer for the chat's earlier pieces")
+            if len(ids) > _PRIOR_ROW_CAP:
+                raise _PriorRowCapExceeded("too many earlier copies of the new pieces' texts")
+            for drawer_id, meta in zip(ids, metas):
+                if not isinstance(meta, dict):
+                    raise _FastPathDecline("unreadable answer for the chat's earlier pieces")
+                index = meta.get("chunk_index")
+                sha = meta.get("chunk_hash")
+                # The chat drawer id is built from this chat's file, wing, room,
+                # extract mode and piece number, so matching it checks those too.
+                if (
+                    isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and 0 <= index < base
+                    and index not in skipped
+                    and sha in batch
+                    and drawer_id
+                    == make_convo_drawer_id(wing, room, source_file, extract_mode, index)
+                    and (sha not in candidates or index < candidates[sha][0])
+                ):
+                    candidates[sha] = (index, drawer_id)
+        rows = [(sha, drawer_id) for sha, (_i, drawer_id) in candidates.items()]
+        for start in range(0, len(rows), 1000):
+            part = rows[start : start + 1000]
+            got = collection.get(ids=[d for _s, d in part], include=["documents"])
+            docs = dict(zip(got.get("ids") or [], got.get("documents") or []))
+            for sha, drawer_id in part:
+                doc = docs.get(drawer_id)
+                if (
+                    not isinstance(doc, str)
+                    or hashlib.sha256(doc.encode("utf-8")).hexdigest() != sha
+                ):
+                    raise _FastPathDecline("an earlier piece's text does not match its label")
+    except _FastPathDecline:
+        raise
+    except Exception as exc:
+        raise _FastPathDecline(f"could not read the chat's earlier pieces: {exc}") from exc
+    return frozenset(candidates)
 
 
 def _load_bookmark(path: Path) -> Optional[dict]:
@@ -1806,11 +1976,13 @@ def _inventory_matches(
     Every row of the label path comes back for ``source_file``, so a row whose
     labels do not say so (missing, padded, unreadable, or a list shorter than
     the ids) is an answer this cannot read, and any doubt declines to the full
-    path.
+    path. Pieces the bookmark lists as ``skipped`` must have no drawer.
     """
+    skipped = _bookmark_skipped(bm)
     want = {
         make_convo_drawer_id(wing, bm["room"], source_file, extract_mode, i)
         for i in range(bm["total"])
+        if i not in skipped
     }
     try:
         if bm["total"] > _INVENTORY_LABEL_FETCH_MAX:
@@ -1952,7 +2124,11 @@ def _exchange_chunks(messages: list, chunk_size: int, min_chunk_size: int) -> tu
 
 
 def _bookmark_from_full(
-    data: bytes, full_chunks: list, chunk_size: int, min_chunk_size: int
+    data: bytes,
+    full_chunks: list,
+    chunk_size: int,
+    min_chunk_size: int,
+    skip: frozenset = frozenset(),
 ) -> Optional[dict]:
     """Bookmark fields for a log the full path just chunked into ``full_chunks``.
 
@@ -1960,7 +2136,13 @@ def _bookmark_from_full(
     so the log may have grown since; only chunks before the snapshot's last user
     turn are compared, and those cannot change with later appends. Returns None
     unless they match the full path's chunks exactly.
+
+    ``skip`` holds the pieces the full path did not store (sysop#297). The
+    anchor (``prev_hash``) is the last STORED piece before ``base``; with none,
+    there is no bookmark.
     """
+    if any(c["chunk_index"] != i for i, c in enumerate(full_chunks)):
+        return None
     parsed = _cc_parse(data)
     last = parsed["last_user"]
     if last is None or last["index"] < 1:
@@ -1987,13 +2169,17 @@ def _bookmark_from_full(
     first = tail_text.split("\n", 1)[0].strip()
     if not full_chunks[base]["content"].startswith(first[:chunk_size]):
         return None
+    anchor = _anchor_index(base, skip)
+    if anchor is None:
+        return None
     return {
         "resume_offset": last["offset"],
         "base": base,
         "tool_map": last["tool_map"],
         "prefix_ts": last["ts_before"],
         "total": len(full_chunks),
-        "prev_hash": hashlib.sha256(full_chunks[base - 1]["content"].encode("utf-8")).hexdigest(),
+        "prev_hash": hashlib.sha256(full_chunks[anchor]["content"].encode("utf-8")).hexdigest(),
+        "skipped": sorted(skip),
     }
 
 
@@ -2098,9 +2284,16 @@ def _write_bookmark_after_full(
     snap,
     chunk_size: int,
     min_chunk_size: int,
+    skip: frozenset = frozenset(),
+    keep_one_fired: bool = False,
 ) -> bool:
-    """Record a bookmark for a log the full path just wrote. Best effort: any doubt writes nothing."""
-    if snap is None or not single_conversation:
+    """Record a bookmark for a log the full path just wrote. Best effort: any doubt writes nothing.
+
+    ``skip`` holds the pieces the full path did not store. When the keep-one rule
+    kept a piece that is itself skippable, no bookmark is written: a bookmark
+    save could not reproduce that choice once the chat grows (sysop#297).
+    """
+    if snap is None or not single_conversation or keep_one_fired:
         return False
     path = _bookmark_path(palace_path, source_file, extract_mode, wing)
     try:
@@ -2114,7 +2307,7 @@ def _write_bookmark_after_full(
             data = fh.read(snap.st_size)
         if len(data) != snap.st_size or _not_plain(data) is not None:
             return False
-        fields = _bookmark_from_full(data, chunks, chunk_size, min_chunk_size)
+        fields = _bookmark_from_full(data, chunks, chunk_size, min_chunk_size, skip=skip)
         if fields is None:
             return False
         fields.update(
@@ -2145,10 +2338,13 @@ def _write_bookmark_after_full(
         return False
 
 
-def _blank_stale_conversation_hash(collection, wing, room, source_file, extract_mode) -> None:
-    """chunk 0's ``content_hash`` names the conversation as the last FULL mine saw it;
-    after a bookmark save that version is gone, so stop advertising it to dedup."""
-    first = make_convo_drawer_id(wing, room, source_file, extract_mode, 0)
+def _blank_stale_conversation_hash(
+    collection, wing, room, source_file, extract_mode, index: int = 0
+) -> None:
+    """The first stored piece's ``content_hash`` names the conversation as the last
+    FULL mine saw it; after a bookmark save that version is gone, so stop
+    advertising it to dedup. ``index`` is that piece: 0 unless saves skip it."""
+    first = make_convo_drawer_id(wing, room, source_file, extract_mode, index)
     got = collection.get(ids=[first], include=["metadatas"])
     metas = got.get("metadatas") or []
     if metas and metas[0] and metas[0].get("content_hash"):
@@ -2191,9 +2387,15 @@ def _fast_path_locked(
     room = bm["room"]
     base, new_total = bm["base"], new_bm["total"]
     hi = max(bm["total"], new_total)
+    skipped_old = _bookmark_skipped(bm)
+    anchor = _anchor_index(base, skipped_old)
+    if anchor is None:  # _bookmark_valid rules this out; refuse rather than guess
+        raise _FastPathDecline("the bookmark has no stored chunk before it")
+    # The anchor plus the pieces from the bookmark on: never the run of skipped
+    # pieces between them, which can be long.
     ids = {
         i: make_convo_drawer_id(wing, room, source_file, extract_mode, i)
-        for i in range(base - 1, hi)
+        for i in (anchor, *range(base, hi))
     }
     existing: dict = {}
     id_list = list(ids.values())
@@ -2201,13 +2403,35 @@ def _fast_path_locked(
         got = collection.get(ids=id_list[start : start + 1000], include=["metadatas"])
         for drawer_id, meta in zip(got.get("ids") or [], got.get("metadatas") or []):
             existing[drawer_id] = meta or {}
-    prev = existing.get(ids[base - 1])
+    prev = existing.get(ids[anchor])
     if prev is None or prev.get("chunk_hash") != bm["prev_hash"]:
         raise _FastPathDecline("the palace no longer holds the chunk before the bookmark")
+
+    # 3D-Stories fork (sysop#297): decide the new pieces as a full read would,
+    # against the pieces this chat already stores before the bookmark.
+    contents = [c["content"] for c in result["chunks"]]
+    if save_dedupe_enabled():
+        try:
+            prior = _stored_prior_hashes(
+                collection, contents, source_file, wing, room, extract_mode, base, skipped_old
+            )
+        except _PriorRowCapExceeded:
+            # Past the cap, keep saving: store the new pieces without the repeat
+            # check against earlier pieces. Boilerplate and repeats inside the new
+            # part are still skipped.
+            prior = frozenset()
+        skip_positions, _ = plan_skips(contents, prior=prior, keep_one=False)
+    else:
+        skip_positions = set()
+    new_skip = frozenset(result["chunks"][p]["chunk_index"] for p in skip_positions)
+    skipped_new = sorted({i for i in skipped_old if i < base} | new_skip)
+    chunk_skipped = len(skipped_new)
 
     filed_at = datetime.now().isoformat()
     to_upsert = []
     for chunk in result["chunks"]:
+        if chunk["chunk_index"] in new_skip:
+            continue
         drawer_id = (
             ids[chunk["chunk_index"]]
             if chunk["chunk_index"] in ids
@@ -2234,9 +2458,28 @@ def _fast_path_locked(
             chunk_hash=chunk_hash,
             source_mtime=st.st_mtime,
             content_hash=None,
+            chunk_skipped=chunk_skipped,
         )
         to_upsert.append((drawer_id, chunk["content"], meta))
-    stale = [ids[i] for i in range(new_total, hi) if ids[i] in existing]
+    stale = [
+        ids[i] for i in range(base, hi) if ids[i] in existing and (i >= new_total or i in new_skip)
+    ]
+
+    # The new bookmark's anchor is the last stored piece before its base: a new
+    # piece, or the old anchor when every piece in between was skipped.
+    skipped_set = frozenset(skipped_new)
+    new_anchor = _anchor_index(new_bm["base"], skipped_set)
+    if new_anchor is None or new_anchor < anchor:
+        raise _FastPathDecline("no stored chunk before the new bookmark")
+    if new_anchor >= base:
+        by_index = {c["chunk_index"]: c["content"] for c in result["chunks"]}
+        if new_anchor not in by_index:
+            raise _FastPathDecline("the new bookmark's anchor is not among the new pieces")
+        new_bm["prev_hash"] = hashlib.sha256(by_index[new_anchor].encode("utf-8")).hexdigest()
+    else:
+        new_bm["prev_hash"] = bm["prev_hash"]
+    new_bm["skipped"] = skipped_new
+    first_stored = next(i for i in range(new_total) if i not in skipped_set)
 
     drawers = _upsert_convo_drawers(collection, to_upsert)
     if stale:
@@ -2244,7 +2487,9 @@ def _fast_path_locked(
             collection.delete(ids=stale)
         except Exception as exc:
             raise _FastPathDecline(f"could not delete {len(stale)} stale drawers: {exc}") from exc
-    _blank_stale_conversation_hash(collection, wing, room, source_file, extract_mode)
+    _blank_stale_conversation_hash(
+        collection, wing, room, source_file, extract_mode, index=first_stored
+    )
     new_bm.update(
         prefix_sha=new_sha,
         size=size,
