@@ -81,6 +81,33 @@ release branch. Upstream is [MemPalace/mempalace](https://github.com/MemPalace/m
      list; its earlier repeats stay until the one-time cleanup removes them.
    - Measured on a copy of the hub's palace (707,738 rows): 130,294 rows (18.4%) were repeats
      inside the same chat, and 40,925 (5.8%) were boilerplate.
+9. **One-time cleanup of boilerplate and same-chat repeats:** `mempalace dedupe-cleanup` removes
+   the rows a save with step 8 would not have stored, from a palace saved before it. It is a dry
+   run unless given `--apply --yes`. `--candidates <file>` lists texts held by at least
+   `--min-chats` chats (25 by default) for review, and `--write-list <file>` writes the reviewed
+   lines to `<config dir>/boilerplate.json`.
+   - Per chat, in piece order, the same rule a full read uses decides what goes: boilerplate, or a
+     repeat of an earlier piece's text, keeping the first copy, and keeping the first piece when
+     every piece would go. It never removes a row a closet or a knowledge-graph triple names, and
+     never a copy only because another chat also holds it.
+   - It then fixes what depends on those rows: each label set's `chunk_skipped` grows by the rows
+     removed from it, so no "already saved?" answer changes; a removed conversation hash moves to
+     the chat's first remaining row; and each affected bookmark gains the removed pieces in
+     `skipped` and re-anchors on the last stored piece before its base.
+   - A chat is left alone, whole, when that cannot be done safely: a file of several
+     conversations, a source file also held under another wing or mode, an older
+     `normalize_version`, a row with no text or with a file time, count or total that is not a
+     plain number, or a new bookmark that would be missing its anchor or fail `_bookmark_valid`.
+   - Applying holds the palace lock, plans again and refuses unless that plan is identical, the
+     sha256 of every removed text included. It copies the palace and its bookmark folder to a
+     backup before it opens the palace for writing, and writes a marker naming that backup. A run
+     that stops part-way leaves the marker: chat saves and every mode of the command refuse until
+     the backup is restored, which is the only recovery. Run it with the hub and the sweep
+     stopped.
+   - Measured on a copy of the hub's palace (668,912 rows, the reviewed 371-text list,
+     2026-10-12): plan in 37 s; 39,671 boilerplate rows and 129,725 repeats removed across 3,084
+     chats; 436,624 rows relabelled; apply in 49 min at the lowest disk priority. The copy had no
+     bookmark folder, so bookmark rewrites are not in that time.
 
 Each commit carries its own tests under `tests/`. Measured numbers and the reasons for each step
 are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md`.
@@ -88,7 +115,7 @@ are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md
 ## Install on the hub
 
 ```bash
-pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-5'
+pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-6'
 ```
 
 Pin the dependencies to the versions already installed, so a reinstall cannot move ChromaDB under
@@ -104,5 +131,5 @@ the palace. Restart `mempalace-hub` afterwards, only when no mine is running.
 
 ## Sending fixes upstream
 
-Steps 2 to 8 are this fork's own work. Each can go upstream as a pull request from a branch cut off
+Steps 2 to 9 are this fork's own work. Each can go upstream as a pull request from a branch cut off
 upstream `develop`. Step 1 is already upstream as PR #2408.

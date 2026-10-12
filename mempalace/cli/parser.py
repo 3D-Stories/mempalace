@@ -514,6 +514,25 @@ def main():
         help="Compare sqlite vs HNSW element counts (read-only; never opens a chromadb client)",
     )
 
+    # dedupe-cleanup — one-time removal of boilerplate and same-chat repeats
+    # (3D-Stories fork, sysop#297)
+    p_dedupe = sub.add_parser(
+        "dedupe-cleanup",
+        help="Remove boilerplate and same-chat repeat rows (dry run unless --apply --yes)",
+    )
+    p_dedupe.add_argument("--apply", action="store_true", help="Perform the plan")
+    p_dedupe.add_argument("--yes", action="store_true", help="Confirm --apply")
+    p_dedupe.add_argument(
+        "--candidates", default=None, help="Write texts many chats hold to this file for review"
+    )
+    p_dedupe.add_argument(
+        "--min-chats", type=int, default=25, help="Chats a text needs to be a candidate"
+    )
+    p_dedupe.add_argument(
+        "--write-list", default=None, help="Write the boilerplate list from a reviewed file"
+    )
+    p_dedupe.add_argument("--top", type=int, default=20, help="Chats to list by rows removed")
+
     # daemon
     p_daemon = sub.add_parser("daemon", help="Manage the opt-in long-lived daemon")
     daemon_sub = p_daemon.add_subparsers(dest="daemon_action")
@@ -1003,6 +1022,7 @@ def main():
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
+        "dedupe-cleanup": cmd_dedupe_cleanup,
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
         "hallways": cmd_hallways,
