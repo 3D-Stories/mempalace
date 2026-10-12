@@ -1055,6 +1055,7 @@ def mine_convos(
         )
 
     with mine_palace_lock(palace_path):
+        _refuse_during_cleanup(palace_path)
         return _mine_convos_impl(
             convo_dir,
             palace_path,
@@ -1064,6 +1065,21 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             include_subagents=include_subagents,
+        )
+
+
+def _refuse_during_cleanup(palace_path: str) -> None:
+    """3D-Stories fork (sysop#297): no chat save while a duplicate cleanup is unfinished.
+
+    A cleanup that stopped part-way leaves its marker in the palace, and only
+    restoring the backup it took repairs the palace. A chat saved in between
+    would be lost by that restore, so saves refuse with ``CleanupInterrupted``.
+    """
+    from .dedupe_cleanup import MARKER_NAME, CleanupInterrupted, restore_hint
+
+    if os.path.exists(os.path.join(palace_path, MARKER_NAME)):
+        raise CleanupInterrupted(
+            f"a duplicate cleanup stopped part-way: {restore_hint(palace_path)}"
         )
 
 
