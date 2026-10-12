@@ -114,9 +114,11 @@ def file_already_mined(
                     # No completion marker on this drawer — can't verify
                     # completeness for its group, trust the match as before.
                     return True
-                seen = group_counts.get(stored_mtime, 0) + 1
-                group_counts[stored_mtime] = seen
-                if seen >= _stored_target(chunk_total, meta.get("chunk_skipped")):
+                skipped = _skip_key(chunk_total, meta.get("chunk_skipped"))
+                group = (stored_mtime, chunk_total, skipped)
+                seen = group_counts.get(group, 0) + 1
+                group_counts[group] = seen
+                if seen >= _stored_target(chunk_total, skipped):
                     return True
             if not ids:
                 break
@@ -182,17 +184,18 @@ def prefetch_mined_set(
                     continue
                 stored_mtime = meta.get("source_mtime")
                 mtime_key = float(stored_mtime) if stored_mtime is not None else None
-                entry = groups.setdefault(src, {}).setdefault(
-                    mtime_key, {"count": 0, "chunk_total": None, "chunk_skipped": None}
-                )
-                entry["count"] += 1
                 chunk_total = meta.get("chunk_total")
+                row_total = None  # not ``total``: that bounds the paging loop
                 if chunk_total is not None:
                     try:
-                        entry["chunk_total"] = int(chunk_total)
+                        row_total = int(chunk_total)
                     except (TypeError, ValueError):
                         pass
-                entry["chunk_skipped"] = meta.get("chunk_skipped")
+                # 3D-Stories fork (sysop#297): one group per label set, so rows
+                # of different saves never add up to one complete save.
+                group = (mtime_key, row_total, _skip_key(row_total, meta.get("chunk_skipped")))
+                groups.setdefault(src, {}).setdefault(group, 0)
+                groups[src][group] += 1
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
@@ -200,17 +203,31 @@ def prefetch_mined_set(
         logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
 
     mined: dict[str, Optional[float]] = {}
-    for src, by_mtime in groups.items():
-        for mtime_key, entry in by_mtime.items():
-            chunk_total = entry["chunk_total"]
+    for src, by_group in groups.items():
+        for (mtime_key, chunk_total, skipped), count in by_group.items():
             if chunk_total is None:
                 # Legacy / registry: no completion marker — trust membership.
                 mined[src] = mtime_key
                 break
-            if entry["count"] >= _stored_target(chunk_total, entry["chunk_skipped"]):
+            if count >= _stored_target(chunk_total, skipped):
                 mined[src] = mtime_key
                 break
     return mined
+
+
+def _skip_key(chunk_total, chunk_skipped):
+    """The skip count a row's completion group is keyed by (3D-Stories fork, sysop#297).
+
+    A missing count is 0 (rows written before the field existed). A malformed
+    one, or one outside ``[0, chunk_total)``, gets a key of its own that no
+    ``int`` can equal, so its rows neither borrow nor lend a count and take no
+    discount in ``_stored_target``.
+    """
+    if chunk_skipped is None:
+        return 0
+    if _stored_target(chunk_total, chunk_skipped) == chunk_total and chunk_skipped != 0:
+        return ("malformed", repr(chunk_skipped))
+    return chunk_skipped
 
 
 def _stored_target(chunk_total, chunk_skipped):

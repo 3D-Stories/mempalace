@@ -33,20 +33,54 @@ release branch. Upstream is [MemPalace/mempalace](https://github.com/MemPalace/m
    twice that or more. Such a log is never read whole, and a declined resume keeps its bookmark.
    Not fixed here: a log that crosses the cap during a full-path save can still lose its
    bookmark, as before this step.
-8. **Saves skip boilerplate and same-chat repeats:** a chat save does not store a piece that
-   starts with one of five fixed markers (`<herdr_model_guidance`, `<local-command-caveat>`,
-   `<local-command-stdout>`, `<command-message>`, `Base directory for this skill:`), a piece whose
-   SHA-256 is on the reviewed list `<config dir>/boilerplate.json`, or a piece whose text an
-   earlier piece of the same chat already holds; the first copy is kept. Pieces keep their numbers,
-   so a skipped piece only leaves a gap. A chat whose every piece would be skipped keeps its first
-   piece and gets no bookmark. The bookmark lists its skipped pieces, and a bookmark save decides
-   the new pieces against the pieces this chat stores before the bookmark, so it stores exactly
-   what a full read would. Each row also carries `chunk_skipped`, and the "already saved?" checks
-   count stored plus skipped. Holding the same text as another chat never makes a piece skipped;
-   only boilerplate is skipped across chats. A missing or
-   malformed list means no listed texts. `MEMPALACE_SAVE_DEDUPE=0` stores every piece again.
-   Measured on a copy of the hub's palace (707,738 rows): 130,294 rows (18.4%) were repeats
-   inside the same chat, and 40,925 (5.8%) were boilerplate.
+7. **Search shows each text once:** hits with identical text collapse to the best-ranked one,
+   whatever chat they came from, before the top-N cut, so the cut fills from the rest of the
+   ranked pool. The kept hit gains `also_in`: how many other chats among the candidates hold the
+   text, and the first three of them, counting only chats whose full source path is known. It
+   covers `search_memories` (vector, union and date-window searches, and the vector-disabled
+   keyword fallback), the command-line `search` (local, and the hub's forwarded output in both
+   its shapes) and the MCP tool's command-line mode, and `Layer3` (reached through
+   `MemoryStack.search`). Union keeps its whole vector fetch while collapse is on, so it
+   can backfill. Where a search fetches only the requested count (the command line without a
+   date window, `Layer3`), a list of copies comes back short instead. `MEMPALACE_SEARCH_COLLAPSE=0`
+   turns it off. 30.7% of the hub's drawers were exact copies, and one search returned the same
+   text in 4 of its top 10 slots.
+8. **Saves skip boilerplate and same-chat repeats:** a save that has one new conversation to store
+   does not store a piece that starts with one of five fixed markers (`<herdr_model_guidance`,
+   `<local-command-caveat>`, `<local-command-stdout>`, `<command-message>`, `Base directory for
+   this skill:`), a piece whose SHA-256 is on the reviewed list `<config dir>/boilerplate.json`,
+   or a piece whose text an earlier piece of the same chat already holds. The first copy is kept.
+   A save with several new conversations of one file (a privacy export) stores every piece,
+   because those conversations are joined before chunking. A file's conversations the palace
+   already holds are not counted, as before this step. Pieces keep their numbers, so a skipped piece only
+   leaves a gap. A chat whose every piece would be skipped keeps its first piece and gets no
+   bookmark. Holding the same text as another chat never makes a piece skipped; only boilerplate
+   is skipped across chats.
+   - The bookmark lists its skipped pieces, and its anchor is the last stored piece before it. A
+     bookmark save decides the new pieces against the pieces this chat stores before the
+     bookmark, asking by this chat's file, and checks their stored text before trusting them.
+     It accepts at most 10,000 rows per 200 texts, asking for one more to see the cap was
+     passed. Past the cap it does not decline: it stores the new pieces without the repeat
+     check against earlier pieces, so a chat over the 500 MB cap, which has no full read,
+     still saves. Boilerplate and repeats inside the new part are still skipped. Past the cap
+     it may store repeats a full read would skip, and those stay behind later bookmarks until
+     the chat is read in full or a cleanup removes them. Otherwise, under an unchanged list
+     and switch, it stores what a full read would. The worst batch on a copy of the hub's
+     palace (2026-10-11) was 6,069 rows.
+   - Every row a save writes or refreshes carries `chunk_skipped`, 0 included (chromadb merges
+     labels, so an omitted one would survive). A row a bookmark save only re-stamps, to clear an
+     old conversation hash, keeps its other labels; a missing count there still means 0. The
+     "already saved?" checks count stored plus skipped, and only rows with the same label set
+     count together.
+   - A missing or malformed list means no listed texts. `MEMPALACE_SAVE_DEDUPE=0` stores every
+     piece of the saves made after it.
+   - Not covered: a change to the list or the switch applies to pieces saved after it. Pieces
+     already behind a bookmark keep the decision made when they were saved, until the chat is
+     read in full again; making a list change re-read every chat would force full reads that
+     chats over the 500 MB cap cannot take. A bookmark written before this step has no skip
+     list; its earlier repeats stay until the one-time cleanup removes them.
+   - Measured on a copy of the hub's palace (707,738 rows): 130,294 rows (18.4%) were repeats
+     inside the same chat, and 40,925 (5.8%) were boilerplate.
 
 Each commit carries its own tests under `tests/`. Measured numbers and the reasons for each step
 are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md`.
@@ -54,7 +88,7 @@ are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md
 ## Install on the hub
 
 ```bash
-pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-3'
+pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-5'
 ```
 
 Pin the dependencies to the versions already installed, so a reinstall cannot move ChromaDB under
