@@ -287,15 +287,9 @@ def _hit_source(hit: dict):
     return source if isinstance(source, str) and source else None
 
 
-def _also_in_note(hit: dict) -> str:
-    """``Also in: 2 other chats (a.jsonl, b.jsonl)`` for a collapsed hit, else ``""``."""
-    note = hit.get("also_in")
-    if not note:
-        return ""
-    count = note["count"]
-    names = ", ".join(Path(source).name for source in note["sources"])
-    more = ", ..." if count > len(note["sources"]) else ""
-    return f"Also in: {count} other chat{'' if count == 1 else 's'} ({names}{more})"
+# The note's one definition lives outside this package so the hub-forwarded
+# command line can print it without importing the local search stack.
+from mempalace.also_in import also_in_note as _also_in_note  # noqa: E402, F401 (re-exported)
 
 
 def _collapse_identical_hits(hits: list) -> list:
