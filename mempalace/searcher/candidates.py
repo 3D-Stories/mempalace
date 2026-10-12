@@ -37,7 +37,10 @@ def _candidate_pool_limits(
     Date-window searches retain the wider current-develop pool because the
     timestamp constraint is applied after retrieval. The normal vector path
     also remains at least four times wide through closet enrichment. Union
-    mode keeps only the requested top vector candidates before lexical merge.
+    mode keeps only the requested top vector candidates before lexical merge,
+    except while search collapse is on (3D-Stories fork, sysop#297): collapse
+    runs after the merge, so union then keeps its whole vector fetch for the
+    top-N cut to backfill from.
     """
     base_query_limit = _candidate_pool_size(
         n_results,
@@ -45,6 +48,8 @@ def _candidate_pool_limits(
     )
 
     if candidate_strategy == "union":
+        if _search_collapse_enabled():
+            return base_query_limit, base_query_limit
         return base_query_limit, n_results
 
     widened = max(
@@ -271,7 +276,26 @@ def _search_collapse_enabled() -> bool:
 
 
 def _hit_source(hit: dict):
-    return hit.get("source_path") or hit.get("_source_file_full") or hit.get("source_file")
+    """The hit's full stored source path, or None when it is not known.
+
+    The basename ``source_file`` (``"?"`` when the drawer has none) is a display
+    label, not an identity, so it is never used.
+    """
+    meta = hit.get("metadata")
+    nested = meta.get("source_file") if isinstance(meta, dict) else None
+    source = hit.get("source_path") or hit.get("_source_file_full") or nested
+    return source if isinstance(source, str) and source else None
+
+
+def _also_in_note(hit: dict) -> str:
+    """``Also in: 2 other chats (a.jsonl, b.jsonl)`` for a collapsed hit, else ``""``."""
+    note = hit.get("also_in")
+    if not note:
+        return ""
+    count = note["count"]
+    names = ", ".join(Path(source).name for source in note["sources"])
+    more = ", ..." if count > len(note["sources"]) else ""
+    return f"Also in: {count} other chat{'' if count == 1 else 's'} ({names}{more})"
 
 
 def _collapse_identical_hits(hits: list) -> list:
@@ -283,7 +307,8 @@ def _collapse_identical_hits(hits: list) -> list:
     these candidates hold the same text, the kept hit gains
     ``also_in = {"count": n, "sources": [...]}``: ``count`` counts them all and
     ``sources`` lists the first three by rank. Counts cover the ranked
-    candidates, not the whole palace. Hits whose text is not a non-blank
+    candidates, not the whole palace, and only chats whose full source path is
+    known on both the kept hit and the copy. Hits whose text is not a non-blank
     string pass through untouched.
     """
     if not _search_collapse_enabled():
@@ -306,7 +331,8 @@ def _collapse_identical_hits(hits: list) -> list:
             continue
 
         source = _hit_source(hit)
-        if source and source != _hit_source(first):
+        first_source = _hit_source(first)
+        if source and first_source and source != first_source:
             seen = other_sources.setdefault(text, [])
             if source not in seen:
                 seen.append(source)

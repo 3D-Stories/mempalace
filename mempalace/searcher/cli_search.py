@@ -68,6 +68,9 @@ def _print_search_results_bm25_only(
         print(f"  [{i}] {wing_name} / {room_name}")
         print(f"      Source: {source}")
         print(f"      Match:  bm25={bm25}  (vector disabled)")
+        note = _also_in_note(hit)
+        if note:
+            print(f"      {note}")
         print()
         for line in (hit.get("text", "") or "").strip().split("\n"):
             print(f"      {line}")
@@ -210,6 +213,9 @@ def search(
         metric=metric,
         stop_words=stop_words,
     )
+    # 3D-Stories fork (sysop#297): show each text once. Without a date window
+    # the fetch is only n_results wide, so a list of copies comes back short.
+    hits = _collapse_identical_hits(hits)
     if date_window_active:
         # The widened fetch exists only to survive the window filter; the
         # display contract stays "top n_results", now cut AFTER the re-rank.
@@ -238,6 +244,9 @@ def search(
         print(f"  [{i}] {wing_name} / {room_name}")
         print(f"      Source: {source}")
         print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
+        note = _also_in_note(hit)
+        if note:
+            print(f"      {note}")
         print()
         # Print the verbatim text, indented
         for line in hit["text"].strip().split("\n"):

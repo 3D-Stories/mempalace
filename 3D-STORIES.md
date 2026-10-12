@@ -36,10 +36,15 @@ release branch. Upstream is [MemPalace/mempalace](https://github.com/MemPalace/m
 7. **Search shows each text once:** hits with identical text collapse to the best-ranked one,
    whatever chat they came from, before the top-N cut, so the cut fills from the rest of the
    ranked pool. The kept hit gains `also_in`: how many other chats among the candidates hold the
-   text, and the first three of them. It covers the vector and union searches and the
-   vector-disabled keyword fallback; the command-line `search` is unchanged, since it fetches only
-   the requested count. `MEMPALACE_SEARCH_COLLAPSE=0` turns it off. 30.7% of the hub's drawers
-   were exact copies, and one search returned the same text in 4 of its top 10 slots.
+   text, and the first three of them, counting only chats whose full source path is known. It
+   covers `search_memories` (vector, union and date-window searches, and the vector-disabled
+   keyword fallback), the command-line `search` (local, and the hub's forwarded output in both
+   its shapes) and the MCP tool's command-line mode, and `Layer3` (reached through
+   `MemoryStack.search`). Union keeps its whole vector fetch while collapse is on, so it
+   can backfill. Where a search fetches only the requested count (the command line without a
+   date window, `Layer3`), a list of copies comes back short instead. `MEMPALACE_SEARCH_COLLAPSE=0`
+   turns it off. 30.7% of the hub's drawers were exact copies, and one search returned the same
+   text in 4 of its top 10 slots.
 
 Each commit carries its own tests under `tests/`. Measured numbers and the reasons for each step
 are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md`.

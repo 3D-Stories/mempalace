@@ -128,6 +128,16 @@ def _print_hub_search_result(args, result: dict) -> bool:
             print(f"      Match:  bm25={bm25}  (vector disabled)")
         else:
             print(f"      Match:  similarity={similarity}  bm25={bm25}")
+        # 3D-Stories fork (sysop#297): the same note the local printers show.
+        # The hit came over the wire, so a note this cannot read prints none.
+        from mempalace.searcher import _also_in_note
+
+        try:
+            note = _also_in_note(hit)
+        except (KeyError, TypeError, AttributeError):
+            note = ""
+        if note:
+            print(f"      {note}")
         print()
         for line in (hit.get("text") or "").strip().split("\n"):
             print(f"      {line}")
