@@ -26,6 +26,8 @@ from collections import defaultdict
 from .config import MempalaceConfig
 from .palace import MineAlreadyRunning, get_collection as _get_collection
 from .searcher import (
+    _also_in_note,
+    _collapse_identical_hits,
     _distance_to_similarity,
     _first_or_empty,
     _metric_for_collection,
@@ -374,10 +376,16 @@ class Layer3:
             return "No results found."
 
         metric = _metric_for_collection(col)
+        # 3D-Stories fork (sysop#297): show each text once.
+        rows = _collapse_identical_hits(
+            [
+                {"text": doc or "", "metadata": meta or {}, "distance": dist}
+                for doc, meta, dist in zip(docs, metas, dists)
+            ]
+        )
         lines = [f'## L3 — SEARCH RESULTS for "{query}"']
-        for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
-            meta = meta or {}
-            doc = doc or ""
+        for i, row in enumerate(rows, 1):
+            meta, doc, dist = row["metadata"], row["text"], row["distance"]
             similarity = round(_distance_to_similarity(dist, metric), 3)
             wing_name = meta.get("wing", "?")
             room_name = meta.get("room", "?")
@@ -391,6 +399,9 @@ class Layer3:
             lines.append(f"      {snippet}")
             if source:
                 lines.append(f"      src: {source}")
+            note = _also_in_note(row)
+            if note:
+                lines.append(f"      {note}")
             authored = (meta.get("authored_at") or "")[:10]
             if authored:
                 lines.append(f"      authored: {authored}")
@@ -448,7 +459,8 @@ class Layer3:
                     "metadata": meta,
                 }
             )
-        return hits
+        # 3D-Stories fork (sysop#297): show each text once.
+        return _collapse_identical_hits(hits)
 
 
 # ---------------------------------------------------------------------------

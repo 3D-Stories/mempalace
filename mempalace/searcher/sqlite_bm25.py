@@ -318,7 +318,10 @@ def _bm25_only_via_sqlite(
         c["bm25_score"] = round(raw, 3)
         c["_score"] = (raw / max_bm25) if max_bm25 > 0 else 0.0
     candidates.sort(key=lambda c: c["_score"], reverse=True)
-    hits = candidates[:n_results]
+    # 3D-Stories fork (sysop#297): show each text once. A caller that asks for
+    # the internal fields (``_include_internal``) gets the raw ranked list.
+    ranked = candidates if _include_internal else _collapse_identical_hits(candidates)
+    hits = ranked[:n_results]
     for h in hits:
         h.pop("_score", None)
         # Strip internal fields by default so the public BM25-only fallback

@@ -398,7 +398,10 @@ def test_real_chromadb_source_scoped_search_returns_no_duplicate_rendered_passag
     )
 
 
-def test_candidate_pool_limits_widen_only_default_vector_strategy():
+def test_candidate_pool_limits_widen_only_default_vector_strategy(monkeypatch):
+    # 3D-Stories fork (sysop#297): with search collapse on, union keeps its whole
+    # vector fetch (tests/test_search_collapse.py); this pins upstream's limits.
+    monkeypatch.setenv("MEMPALACE_SEARCH_COLLAPSE", "0")
     assert _candidate_pool_limits(
         "vector",
         5,

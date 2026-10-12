@@ -37,7 +37,10 @@ def _candidate_pool_limits(
     Date-window searches retain the wider current-develop pool because the
     timestamp constraint is applied after retrieval. The normal vector path
     also remains at least four times wide through closet enrichment. Union
-    mode keeps only the requested top vector candidates before lexical merge.
+    mode keeps only the requested top vector candidates before lexical merge,
+    except while search collapse is on (3D-Stories fork, sysop#297): collapse
+    runs after the merge, so union then keeps its whole vector fetch for the
+    top-N cut to backfill from.
     """
     base_query_limit = _candidate_pool_size(
         n_results,
@@ -45,6 +48,8 @@ def _candidate_pool_limits(
     )
 
     if candidate_strategy == "union":
+        if _search_collapse_enabled():
+            return base_query_limit, base_query_limit
         return base_query_limit, n_results
 
     widened = max(
@@ -255,6 +260,86 @@ def _dedupe_rendered_hits(
     return unique
 
 
+# 3D-Stories fork (sysop#297): search shows each text once.
+_COLLAPSE_LISTED_SOURCES = 3
+_COLLAPSE_OFF_VALUES = ("0", "false", "no", "off")
+
+
+def _search_collapse_enabled() -> bool:
+    """Whether identical-text hits collapse (``MEMPALACE_SEARCH_COLLAPSE``).
+
+    On unless the variable is ``0``, ``false``, ``no`` or ``off``, in any case
+    and ignoring surrounding spaces.
+    """
+    raw = os.environ.get("MEMPALACE_SEARCH_COLLAPSE")
+    return raw is None or raw.strip().lower() not in _COLLAPSE_OFF_VALUES
+
+
+def _hit_source(hit: dict):
+    """The hit's full stored source path, or None when it is not known.
+
+    The basename ``source_file`` (``"?"`` when the drawer has none) is a display
+    label, not an identity, so it is never used.
+    """
+    meta = hit.get("metadata")
+    nested = meta.get("source_file") if isinstance(meta, dict) else None
+    source = hit.get("source_path") or hit.get("_source_file_full") or nested
+    return source if isinstance(source, str) and source else None
+
+
+# The note's one definition lives outside this package so the hub-forwarded
+# command line can print it without importing the local search stack.
+from mempalace.also_in import also_in_note as _also_in_note  # noqa: E402, F401 (re-exported)
+
+
+def _collapse_identical_hits(hits: list) -> list:
+    """Keep the best-ranked hit of each identical text; note the other chats.
+
+    Runs on a ranked list, best first, before the caller's top-N slice, so the
+    slice backfills from the rest of the pool. A later hit whose text equals an
+    earlier one drops out, whatever chat it came from. When other chats among
+    these candidates hold the same text, the kept hit gains
+    ``also_in = {"count": n, "sources": [...]}``: ``count`` counts them all and
+    ``sources`` lists the first three by rank. Counts cover the ranked
+    candidates, not the whole palace, and only chats whose full source path is
+    known on both the kept hit and the copy. Hits whose text is not a non-blank
+    string pass through untouched.
+    """
+    if not _search_collapse_enabled():
+        return hits
+
+    kept = []
+    first_by_text: dict = {}
+    other_sources: dict = {}
+
+    for hit in hits:
+        text = hit.get("text")
+        if not isinstance(text, str) or not text.strip():
+            kept.append(hit)
+            continue
+
+        first = first_by_text.get(text)
+        if first is None:
+            first_by_text[text] = hit
+            kept.append(hit)
+            continue
+
+        source = _hit_source(hit)
+        first_source = _hit_source(first)
+        if source and first_source and source != first_source:
+            seen = other_sources.setdefault(text, [])
+            if source not in seen:
+                seen.append(source)
+
+    for text, sources in other_sources.items():
+        first_by_text[text]["also_in"] = {
+            "count": len(sources),
+            "sources": sources[:_COLLAPSE_LISTED_SOURCES],
+        }
+
+    return kept
+
+
 # Strategy dispatch — keeps search_memories' branch count under the
 # project's complexity ceiling (C901 max-complexity=25). New strategies
 # register here.
@@ -358,7 +443,7 @@ def _finalize_candidate_hits(
         metric=_metric_for_collection(drawers_col),
         stop_words=stop_words,
     )
-    hits = _dedupe_rendered_hits(ranked)[:n_results]
+    hits = _collapse_identical_hits(_dedupe_rendered_hits(ranked))[:n_results]
 
     for hit in hits:
         hit.pop("_sort_key", None)
