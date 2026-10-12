@@ -490,3 +490,23 @@ def test_hub_structured_results_with_a_malformed_note_still_print(capsys, also_i
     out = capsys.readouterr().out
     assert out.count(REPEATED) == 1
     assert "Also in" not in out
+
+
+@pytest.mark.parametrize(
+    "note, expected",
+    [
+        (
+            {"count": 5, "sources": ["/chats/a.jsonl", "/chats/b.jsonl", "/chats/c.jsonl"]},
+            "Also in: 5 other chats (a.jsonl, b.jsonl, c.jsonl, ...)",
+        ),
+        (
+            {"count": 2, "sources": ["/chats/a.jsonl", "/chats/b.jsonl"]},
+            "Also in: 2 other chats (a.jsonl, b.jsonl)",
+        ),
+    ],
+    ids=["more-than-listed", "all-listed"],
+)
+def test_the_note_marks_chats_it_does_not_list(note, expected):
+    from mempalace.also_in import also_in_note
+
+    assert also_in_note({"also_in": note}) == expected
