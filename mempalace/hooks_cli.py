@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1238,6 +1239,59 @@ def _scan_transcript_incremental(path: Path) -> _TranscriptScan:
     return _TranscriptScan(count, recent, complete, offset, size)
 
 
+#: Bytes read per step when reading a transcript backwards from its end.
+_RECENT_TAIL_CHUNK = 1 << 20
+#: How far back from the end the tail read goes for the recent messages. The
+#: last 30 user messages sit far inside this in a real session; a transcript
+#: whose last 256 MiB hold fewer gets only the ones found there.
+_RECENT_TAIL_MAX_BYTES = 256 << 20
+
+
+def _extract_recent_messages_tail(
+    transcript_path: str, count: int = _RECENT_MSG_COUNT
+) -> list[str]:
+    """The last ``count`` user messages, read backwards from the end of the file.
+
+    Returns what :func:`_extract_recent_messages` returns, without parsing the
+    whole transcript: SessionEnd and PreCompact use it (sysop #373), and a
+    whole parse of a 3 GB transcript took about as long as SessionEnd's 10 s
+    limit. Lines are judged by :func:`_scan_line`, which the incremental scan's
+    tests hold equal to the full parse; the one known difference, a lone
+    carriage return between two records, is the scan's too. It reads at most
+    ``_RECENT_TAIL_MAX_BYTES`` from the end.
+    """
+    path = Path(transcript_path).expanduser()
+    if count <= 0 or not path.is_file():
+        return []
+    found: list[str] = []  # newest first
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        with open(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return []
+            pos = f.seek(0, os.SEEK_END)
+            budget = _RECENT_TAIL_MAX_BYTES
+            carry = b""  # the start of a line cut by the step boundary
+            while pos > 0 and budget > 0 and len(found) < count:
+                step = min(_RECENT_TAIL_CHUNK, pos, budget)
+                pos -= step
+                budget -= step
+                f.seek(pos)
+                lines = (f.read(step) + carry).split(b"\n")
+                # lines[0] may continue further back, unless this is the file start
+                carry = lines.pop(0) if pos > 0 else b""
+                for raw in reversed(lines):
+                    message = _scan_line(raw.decode("utf-8", errors="replace"))[1]
+                    if message is not None:
+                        found.append(message)
+                        if len(found) >= count:
+                            break
+    except OSError:
+        return []
+    found.reverse()
+    return found
+
+
 def _scan_transcript(transcript_path: str) -> _TranscriptScan:
     """Exchange count and recent messages for the Stop hook, from new bytes only.
 
@@ -1457,12 +1511,13 @@ def _save_diary_direct(
 
     ``recent_messages`` hands over messages the caller already read from the
     transcript (the Stop hook's incremental scan), so the file is not parsed a
-    second time; without it the transcript is parsed here, as before.
+    second time; without it the last messages are read from the end of the
+    transcript here, never the whole file (sysop #373).
     ``hub_timeout`` bounds the wait for a hub write for a caller with a
     deadline; without it the hub wait keeps its default.
     """
     if recent_messages is None:
-        messages = _extract_recent_messages(transcript_path)
+        messages = _extract_recent_messages_tail(transcript_path)
     else:
         messages = recent_messages
     if not messages:

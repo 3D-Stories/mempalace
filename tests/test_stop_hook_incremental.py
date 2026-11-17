@@ -614,10 +614,10 @@ def test_save_stop_reads_the_transcript_once_and_files_the_same_entry(tmp_path, 
     assert (hooks_cli.STATE_DIR / "sess_last_save").read_text(encoding="utf-8") == "40"
 
 
-def test_save_diary_direct_parses_the_transcript_itself_when_not_handed_messages(
+def test_save_diary_direct_reads_the_transcript_end_itself_when_not_handed_messages(
     tmp_path, monkeypatch
 ):
-    """The precompact and session-end hooks call it with no messages, as before."""
+    """The precompact and session-end hooks call it with no messages (sysop #373)."""
     path = tmp_path / "session.jsonl"
     path.write_bytes(_line(_user("from the transcript")) + b"\n")
     filed = []
@@ -628,7 +628,9 @@ def test_save_diary_direct_parses_the_transcript_itself_when_not_handed_messages
     )
 
     with patch.object(
-        hooks_cli, "_extract_recent_messages", wraps=hooks_cli._extract_recent_messages
+        hooks_cli,
+        "_extract_recent_messages_tail",
+        wraps=getattr(hooks_cli, "_extract_recent_messages_tail", None),
     ) as parse:
         hooks_cli._save_diary_direct(str(path), "sess", agent_name="claude")
         assert parse.call_count == 1
@@ -826,3 +828,118 @@ def test_hub_forward_keeps_its_default_wait_for_other_callers(live_hub):
 
     assert status is True
     assert hub.timeouts == {"health": 2.0, "write": 60.0}
+
+
+# ── 8. SessionEnd and PreCompact read only the end of the transcript (sysop #373) ──
+#
+# Both hooks call ``_save_diary_direct`` with no messages. It used to parse the
+# whole transcript for the last 30 user messages; on a 3 GB transcript that one
+# parse took about as long as the 10 s SessionEnd limit. It now reads backwards
+# from the end of the file and stops once it has them.
+
+
+def _fake_hub(monkeypatch):
+    filed = []
+    monkeypatch.setattr(
+        hooks_cli,
+        "_forward_diary_to_hub",
+        lambda agent_name, entry, topic, wing, **kwargs: filed.append(entry) or True,
+    )
+    return filed
+
+
+def _recent_part(entry: str) -> str:
+    return entry.split("|recent:", 1)[1]
+
+
+def _expected_recent(path, monkeypatch) -> str:
+    """The recent part of the entry filed from the full parse's messages."""
+    filed = _fake_hub(monkeypatch)
+    hooks_cli._save_diary_direct(
+        str(path),
+        "sess",
+        agent_name="claude",
+        recent_messages=hooks_cli._extract_recent_messages(str(path)),
+    )
+    return _recent_part(filed[0])
+
+
+def _run_session_end(path):
+    with patch.object(hooks_cli, "MempalaceConfig") as cfg:
+        cfg.return_value.hooks_auto_save = True
+        cfg.return_value.hook_desktop_toast = False
+        with patch.object(hooks_cli, "_output"):
+            hooks_cli.hook_session_end(
+                {"session_id": "sess", "transcript_path": str(path)}, "claude-code"
+            )
+
+
+def _run_precompact(path):
+    with patch.object(hooks_cli, "MempalaceConfig") as cfg:
+        cfg.return_value.hooks_auto_save = True
+        cfg.return_value.hooks_mine_transcript = False  # the branch that files a diary entry
+        cfg.return_value.hook_desktop_toast = False
+        with patch.object(hooks_cli, "_mine_sync"), patch.object(hooks_cli, "_output"):
+            hooks_cli.hook_precompact(
+                {"session_id": "sess", "transcript_path": str(path)}, "claude-code"
+            )
+
+
+@pytest.mark.parametrize("run_hook", [_run_session_end, _run_precompact])
+def test_session_end_and_precompact_never_parse_the_whole_transcript(
+    tmp_path, monkeypatch, run_hook
+):
+    path = tmp_path / "session.jsonl"
+    _big_transcript(path, user_rows=40)
+    expected = _expected_recent(path, monkeypatch)
+    filed = _fake_hub(monkeypatch)
+
+    whole = AssertionError("the whole transcript was parsed")
+    with patch.object(hooks_cli, "_extract_recent_messages", side_effect=whole) as parse:
+        run_hook(path)
+    assert parse.call_count == 0
+    assert len(filed) == 1, "the hook must still file its diary entry"
+    assert "|msgs:30|" in filed[0]
+    assert _recent_part(filed[0]) == expected
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 64, 333, 4096, 1 << 20])
+@pytest.mark.parametrize("ends_with_newline", [True, False])
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_tail_read_equals_the_full_parse(tmp_path, monkeypatch, seed, ends_with_newline, chunk):
+    monkeypatch.setattr(hooks_cli, "_RECENT_TAIL_CHUNK", chunk, raising=False)
+    rng = random.Random(seed)
+    path = tmp_path / "session.jsonl"
+    path.write_bytes(_transcript_bytes(rng, ends_with_newline))
+    for count in (1, 5, hooks_cli._RECENT_MSG_COUNT, 10_000):
+        assert hooks_cli._extract_recent_messages_tail(
+            str(path), count
+        ) == hooks_cli._extract_recent_messages(str(path), count), f"count {count}"
+
+
+def test_tail_read_of_a_missing_empty_or_odd_path_is_empty(tmp_path):
+    assert hooks_cli._extract_recent_messages_tail(str(tmp_path / "absent.jsonl")) == []
+    (tmp_path / "empty.jsonl").write_bytes(b"")
+    assert hooks_cli._extract_recent_messages_tail(str(tmp_path / "empty.jsonl")) == []
+    assert hooks_cli._extract_recent_messages_tail(str(tmp_path)) == []
+    fifo = tmp_path / "pipe.jsonl"
+    os.mkfifo(fifo)
+    assert hooks_cli._extract_recent_messages_tail(str(fifo)) == []  # never blocks on open
+
+
+def test_tail_read_reads_only_the_end_of_a_big_transcript(tmp_path):
+    path = tmp_path / "session.jsonl"
+    size = _big_transcript(path, user_rows=400, filler_rows=4000)
+    with _count_transcript_reads(path) as counter:
+        recent = hooks_cli._extract_recent_messages_tail(str(path))
+    assert recent == hooks_cli._extract_recent_messages(str(path))
+    assert counter["bytes"] < size // 4, f"read {counter['bytes']} of {size} bytes"
+
+
+def test_tail_read_stops_at_its_byte_cap(tmp_path, monkeypatch):
+    path = tmp_path / "session.jsonl"
+    old = _line(_user("old question")) + b"\n"
+    filler = _line(_assistant("x" * 2000)) + b"\n"
+    path.write_bytes(old + filler * 50 + _line(_user("new question")) + b"\n")
+    monkeypatch.setattr(hooks_cli, "_RECENT_TAIL_MAX_BYTES", 20_000, raising=False)
+    assert hooks_cli._extract_recent_messages_tail(str(path)) == ["new question"]
