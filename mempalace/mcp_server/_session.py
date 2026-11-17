@@ -23,6 +23,7 @@ def _get_client():
         _collection_open_error, \
         _palace_db_inode, \
         _palace_db_mtime, \
+        _palace_db_identity, \
         _metadata_cache, \
         _metadata_cache_time
     if not _is_chroma_backend():
@@ -52,6 +53,14 @@ def _get_client():
 
     inode_changed = current_inode != 0 and current_inode != _palace_db_inode
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
+    if (
+        not (inode_changed or mtime_changed)
+        and _palace_db_identity is not None
+        and _db_identity(_config.palace_path) != _palace_db_identity
+    ):
+        # A commit inside the mtime tolerance after our own re-stamp: only the
+        # file's change counter shows it, and it is not ours (#372 review A2).
+        mtime_changed = True
 
     if (
         _client_cache is not None
@@ -62,6 +71,7 @@ def _get_client():
         # cache, a mine or a search in this hub (sysop #372). Not a peer.
         _palace_db_inode = current_inode
         _palace_db_mtime = current_mtime
+        _palace_db_identity = _db_identity(_config.palace_path)
         return _client_cache
 
     newer = (
@@ -85,6 +95,7 @@ def _get_client():
             _invalidate_overview_caches()
             _palace_db_inode = current_inode
             _palace_db_mtime = current_mtime
+            _palace_db_identity = _db_identity(_config.palace_path)
             return _client_cache
 
     if _client_cache is None or inode_changed or mtime_changed:
@@ -110,6 +121,7 @@ def _get_client():
         _invalidate_overview_caches()
         _palace_db_inode = current_inode
         _palace_db_mtime = current_mtime
+        _palace_db_identity = None
     return _client_cache
 
 
@@ -127,14 +139,17 @@ class _SessionStamp:
 
     Passed as ``backend=`` to the hub's ``ChromaCollection`` so its write lock
     calls ``_restamp`` once the write is done, still under the palace lock.
-    Same trade-off as the backend's: a peer write that lands inside one of our
-    own operations is absorbed into the new stamp.
+    It re-stamps only while this process holds the palace lock, so no
+    cooperating peer can have committed in between (#372 review A1). Without
+    the lock it leaves the stamp alone, and the next call rebuilds as before.
     """
 
     @staticmethod
     def _restamp(palace_path):
-        global _palace_db_inode, _palace_db_mtime
+        global _palace_db_inode, _palace_db_mtime, _palace_db_identity
         if _client_cache is None or palace_path != _config.palace_path:
+            return
+        if not palace_lock_held_here(palace_path):
             return
         try:
             st = os.stat(os.path.join(palace_path, "chroma.sqlite3"))
@@ -142,6 +157,7 @@ class _SessionStamp:
             return
         _palace_db_inode = st.st_ino
         _palace_db_mtime = st.st_mtime
+        _palace_db_identity = _db_identity(palace_path)
         note_own_db_state(palace_path, _client_cache)
 
 

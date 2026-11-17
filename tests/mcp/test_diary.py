@@ -417,6 +417,19 @@ class TestDiaryTools:
 # ── sysop #372: the hub's own writes must not look like a peer's ─────────
 
 
+import pytest
+
+
+@pytest.fixture
+def hub_lease(palace_path):
+    """Hold the palace lock for the test, as the live writable hub holds its
+    lifetime writer lease (``_guards`` enters ``mine_palace_lock``)."""
+    from mempalace.palace import mine_palace_lock
+
+    with mine_palace_lock(palace_path):
+        yield
+
+
 def _count_client_builds(monkeypatch):
     from mempalace import mcp_server
 
@@ -431,7 +444,7 @@ def _count_client_builds(monkeypatch):
     return builds
 
 
-def test_hub_writes_and_reads_reuse_one_client(monkeypatch, config, palace_path, kg):
+def test_hub_writes_and_reads_reuse_one_client(monkeypatch, config, palace_path, kg, hub_lease):
     """sysop #372: every diary write on the live hub rebuilt the client.
 
     ``_get_client`` stamps chroma.sqlite3's mtime only when it builds a client,
@@ -467,7 +480,7 @@ def test_hub_writes_and_reads_reuse_one_client(monkeypatch, config, palace_path,
     assert len(builds) == 1, f"the hub rebuilt its client {len(builds) - 1} times for its own writes"
 
 
-def test_a_peer_write_still_rebuilds_the_hub_client(monkeypatch, config, palace_path, kg):
+def test_a_peer_write_still_rebuilds_the_hub_client(monkeypatch, config, palace_path, kg, hub_lease):
     """The re-stamp covers only the hub's own writes: a change it did not make
     (here, the file's mtime moved by hand) still rebuilds the client (#2002)."""
     import os
@@ -489,7 +502,7 @@ def test_a_peer_write_still_rebuilds_the_hub_client(monkeypatch, config, palace_
     assert len(builds) == 2
 
 
-def test_hub_diary_writes_mines_and_searches_share_one_engine(monkeypatch, config, palace_path, kg, tmp_path):
+def test_hub_diary_writes_mines_and_searches_share_one_engine(monkeypatch, config, palace_path, kg, tmp_path, hub_lease):
     """sysop #372: on the live hub a diary write follows mines and searches from
     other sessions. Those go through ``ChromaBackend``'s own client cache, and
     each cache read the other's write as a peer process's: it cleared chromadb's
@@ -561,3 +574,79 @@ def test_hub_diary_writes_mines_and_searches_share_one_engine(monkeypatch, confi
         f"{len(distinct)} engines built for {len(checks)} post-mine checks; "
         "each extra one reloads the whole index"
     )
+
+
+def _peer_commit(db, mtime_ns=None):
+    """Commit to chroma.sqlite3 through another SQLite connection, as a peer
+    process would. With ``mtime_ns``, pin the file's mtime there afterwards."""
+    import os
+    import sqlite3
+
+    con = sqlite3.connect(db)
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS _peer_probe (x)")
+        con.execute("INSERT INTO _peer_probe VALUES (1)")
+        con.commit()
+    finally:
+        con.close()
+    if mtime_ns is not None:
+        os.utime(db, ns=(mtime_ns, mtime_ns))
+
+
+def test_a_peer_commit_inside_the_mtime_tolerance_still_rebuilds(monkeypatch, config, palace_path, kg, hub_lease):
+    """Review finding A2 on sysop #372: after the hub re-stamps for its own write,
+    a peer's commit within 10 ms of that write, on the same inode, was invisible:
+    the session gate looks only at inode and mtime. The file's change counter
+    moved, so the hub must rebuild (#2002)."""
+    import os
+    import time
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+    from mempalace import mcp_server
+
+    builds = _count_client_builds(monkeypatch)
+    time.sleep(0.05)
+    assert mcp_server.tool_diary_write(agent_name="hub", entry="one", topic="checkpoint")["success"]
+    assert len(builds) == 1
+    db = os.path.join(palace_path, "chroma.sqlite3")
+    own = os.stat(db).st_mtime_ns
+    _peer_commit(db, mtime_ns=own + 5_000_000)  # 5 ms later, inside the tolerance
+    mcp_server._get_client()
+    assert len(builds) == 2, "a peer commit inside the mtime tolerance was taken as the hub's own state"
+
+
+def test_a_peer_commit_during_a_collection_open_still_rebuilds(monkeypatch, config, palace_path, kg):
+    """Review finding A1 on sysop #372: the re-stamp after a collection open ran
+    outside the palace lock, so a peer commit that landed during the open was
+    recorded as the hub's own state and never rebuilt. A process that does not
+    hold the palace lock must not take a change it cannot prove as its own."""
+    import os
+    import time
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+    from mempalace import mcp_server
+
+    db = os.path.join(palace_path, "chroma.sqlite3")
+    real_pin = mcp_server._pin_hnsw_threads
+    peer = []
+
+    def pin_then_peer_commits(raw):
+        real_pin(raw)
+        if not peer:
+            time.sleep(0.05)
+            _peer_commit(db)
+            peer.append(True)
+
+    monkeypatch.setattr(mcp_server, "_pin_hnsw_threads", pin_then_peer_commits)
+    mcp_server._client_cache = None
+    mcp_server._collection_cache = None
+    builds = _count_client_builds(monkeypatch)
+    assert mcp_server._get_collection() is not None
+    assert peer and len(builds) == 1
+    time.sleep(0.05)
+    mcp_server._get_client()
+    assert len(builds) == 2, "a peer commit during the collection open was recorded as the hub's own"

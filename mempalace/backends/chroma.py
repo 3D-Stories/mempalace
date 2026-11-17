@@ -2251,7 +2251,13 @@ def _engine_of(client):
 def note_own_db_state(palace_path: str, client) -> None:
     """Record chroma.sqlite3 as this process's ``client`` just left it (sysop #372).
 
-    Call only right after this process's own write or collection open on it."""
+    Call only right after this process's own write or collection open on it.
+    Records nothing unless this process holds the palace lock: without it a peer
+    can commit in between, and its change must not pass as ours (review A1)."""
+    from ..palace import palace_lock_held_here
+
+    if not palace_lock_held_here(palace_path):
+        return
     engine = _engine_of(client)
     identity = _db_identity(palace_path)
     if engine is None or identity is None:

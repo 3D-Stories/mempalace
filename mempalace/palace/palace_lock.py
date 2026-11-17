@@ -137,6 +137,20 @@ def _holder_keys_locked():
     return _palace_lock_keys
 
 
+def _palace_lock_key(palace_path: str) -> str:
+    """The lock key ``mine_palace_lock`` uses for ``palace_path``."""
+    resolved = os.path.realpath(os.path.expanduser(palace_path))
+    return hashlib.sha256(os.path.normcase(resolved).encode()).hexdigest()[:16]
+
+
+def palace_lock_held_here(palace_path: str) -> bool:
+    """True when this process holds ``mine_palace_lock`` for ``palace_path``.
+
+    While it does, no cooperating process can commit to the palace, so a change
+    to ``chroma.sqlite3`` is this process's own (sysop #372)."""
+    return _held_by_this_process(_palace_lock_key(palace_path))
+
+
 def _held_by_this_process(lock_key: str) -> bool:
     """Return True if this process already holds ``mine_palace_lock`` for ``lock_key``."""
     with _palace_lock_guard:
@@ -240,8 +254,7 @@ def mine_palace_lock(palace_path: str):
     lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
     os.makedirs(lock_dir, exist_ok=True)
     resolved = os.path.realpath(os.path.expanduser(palace_path))
-    lock_key_source = os.path.normcase(resolved)
-    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
+    palace_key = _palace_lock_key(palace_path)
     lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
 
     if _held_by_this_process(palace_key):
