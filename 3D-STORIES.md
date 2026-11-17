@@ -108,6 +108,26 @@ release branch. Upstream is [MemPalace/mempalace](https://github.com/MemPalace/m
      2026-10-12): plan in 37 s; 39,671 boilerplate rows and 129,725 repeats removed across 3,084
      chats; 436,624 rows relabelled; apply in 49 min at the lowest disk priority. The copy had no
      bookmark folder, so bookmark rewrites are not in that time.
+10. **The Stop hook reads only new bytes, and its hub wait fits the hook:** every Stop used to
+    parse the whole chat log to count messages, a save Stop parsed it a second time, and the save
+    then waited up to 60 s for the hub inside a hook Claude Code kills at 30 s. On logs of 3 GB
+    the hook was killed before it wrote its `_last_save` marker, so the save ran again on every
+    Stop and the hub filed the same diary note again (389 killed Stops and 604 repeat notes
+    measured on the hub machine, 2026-11-16).
+    - The count and the recent messages now come from one pass over the bytes added since the last
+      Stop. The place reached is kept per log in `hook_state/scan_<hash>.json`. The scan starts
+      again from zero when the log is shorter than the saved place, when its first 4096 bytes
+      differ, or when the saved place is no longer a line start. Any error falls back to the two
+      full parses, which are unchanged and are what the tests compare the scan against.
+    - A first scan is cut at 10 s, keeps its place, and that Stop saves nothing. The next Stop
+      carries on. Measured on a 3.2 GB log: two Stops (10.0 s, then 1.5 s), then 0.0003 s per
+      Stop; the old two parses took 8.5 to 9.8 s each, on every save Stop.
+    - The hub wait is cut to what the hook has left (25 s planned, 3 s kept back, never under
+      1 s). A wait that runs out returns as before: nothing is written a second time, and the
+      marker moves when the save of the log itself was started.
+    - Not covered: the daemon route still waits up to 30 s, and the session-end and pre-compact
+      hooks still parse the whole log. A log rewritten in the middle with the same first 4096
+      bytes is not noticed; Claude Code only appends.
 
 Each commit carries its own tests under `tests/`. Measured numbers and the reasons for each step
 are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md`.
@@ -115,7 +135,7 @@ are in the 3D-Stories `claude-skills` repository, `tools/mempalace-hub/README.md
 ## Install on the hub
 
 ```bash
-pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-6'
+pipx install --force 'git+https://github.com/3D-Stories/mempalace@3ds-v3.10.0-7'
 ```
 
 Pin the dependencies to the versions already installed, so a reinstall cannot move ChromaDB under
@@ -131,5 +151,5 @@ the palace. Restart `mempalace-hub` afterwards, only when no mine is running.
 
 ## Sending fixes upstream
 
-Steps 2 to 9 are this fork's own work. Each can go upstream as a pull request from a branch cut off
+Steps 2 to 10 are this fork's own work. Each can go upstream as a pull request from a branch cut off
 upstream `develop`. Step 1 is already upstream as PR #2408.

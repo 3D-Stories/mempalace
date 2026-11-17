@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from hypothesis import given
@@ -507,8 +507,17 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     assert result["systemMessage"].startswith("\u2726 15 memories woven into the palace")
     assert "hooks" in result["systemMessage"]
     # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
+    # The Stop hook hands over the messages its own scan read, and the hub wait
+    # it has left, so the save neither parses the transcript again nor outlasts
+    # the hook.
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+        str(transcript),
+        "test",
+        wing="wing_sessions",
+        toast=False,
+        agent_name="claude",
+        recent_messages=[f"msg {i}" for i in range(SAVE_INTERVAL)],
+        hub_timeout=ANY,
     )
 
 
@@ -528,8 +537,17 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
             state_dir=tmp_path,
         )
+    # The Stop hook hands over the messages its own scan read, and the hub wait
+    # it has left, so the save neither parses the transcript again nor outlasts
+    # the hook.
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_myproject", toast=False, agent_name="claude"
+        str(transcript),
+        "test",
+        wing="wing_myproject",
+        toast=False,
+        agent_name="claude",
+        recent_messages=[f"msg {i}" for i in range(SAVE_INTERVAL)],
+        hub_timeout=ANY,
     )
 
 
