@@ -1085,6 +1085,9 @@ _collection_cache_palace = None
 _collection_open_error = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
 _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
+# chroma.sqlite3's full identity at a re-stamp for the hub's own write, else None.
+# Inside the 0.01 s mtime tolerance only this can show a peer's commit (#372 A2).
+_palace_db_identity = None
 
 
 def _is_transient_index_error(result) -> bool:

@@ -93,11 +93,16 @@ from ..backends.chroma import (  # noqa: E402
     ChromaBackend,
     ChromaCollection,
     _HNSW_WRITE_DEFAULTS,
+    _db_identity,
     _pin_hnsw_threads,
+    changed_by_own_engine,
+    current_own_engine,
     hnsw_capacity_status,
+    note_own_db_state,
     reset_hnsw_capacity_cache,
 )
 from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
+from ..palace import palace_lock_held_here  # noqa: E402
 from ..date_window import filed_at_in_window, parse_date_bound  # noqa: E402
 from ..query_sanitizer import sanitize_query  # noqa: E402
 from ..searcher import (  # noqa: E402

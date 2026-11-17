@@ -23,6 +23,7 @@ def _get_client():
         _collection_open_error, \
         _palace_db_inode, \
         _palace_db_mtime, \
+        _palace_db_identity, \
         _metadata_cache, \
         _metadata_cache_time
     if not _is_chroma_backend():
@@ -52,6 +53,50 @@ def _get_client():
 
     inode_changed = current_inode != 0 and current_inode != _palace_db_inode
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
+    if (
+        not (inode_changed or mtime_changed)
+        and _palace_db_identity is not None
+        and _db_identity(_config.palace_path) != _palace_db_identity
+    ):
+        # A commit inside the mtime tolerance after our own re-stamp: only the
+        # exact identity shows it, and it is not ours (#372 review A2).
+        mtime_changed = True
+
+    if (
+        _client_cache is not None
+        and (inode_changed or mtime_changed)
+        and changed_by_own_engine(_config.palace_path, _client_cache)
+    ):
+        # This process wrote it, through the engine we hold: the backend's
+        # cache, a mine or a search in this hub (sysop #372). Not a peer.
+        _palace_db_inode = current_inode
+        _palace_db_mtime = current_mtime
+        _palace_db_identity = _db_identity(_config.palace_path)
+        return _client_cache
+
+    newer = (
+        current_own_engine(_config.palace_path)
+        if _client_cache is not None and (inode_changed or mtime_changed)
+        else None
+    )
+    if newer is not None:
+        # Another cache in this process rebuilt the engine and wrote through it
+        # (the post-mine check clears chromadb's cache). Adopt that engine rather
+        # than reset and build a third one, which would reload the index again
+        # (sysop #372). Fall through to the full rebuild if it is not on offer.
+        _refresh_vector_disabled_flag()
+        adopted = ChromaBackend.make_client(_config.palace_path)
+        if getattr(adopted, "_server", None) is newer:
+            _client_cache = adopted
+            _collection_cache = None
+            _collection_cache_backend = None
+            _collection_cache_palace = None
+            _collection_open_error = None
+            _invalidate_overview_caches()
+            _palace_db_inode = current_inode
+            _palace_db_mtime = current_mtime
+            _palace_db_identity = _db_identity(_config.palace_path)
+            return _client_cache
 
     if _client_cache is None or inode_changed or mtime_changed:
         # Run the HNSW capacity probe BEFORE chromadb opens the segment --
@@ -76,7 +121,44 @@ def _get_client():
         _invalidate_overview_caches()
         _palace_db_inode = current_inode
         _palace_db_mtime = current_mtime
+        _palace_db_identity = None
     return _client_cache
+
+
+class _SessionStamp:
+    """Re-stamp ``_get_client``'s freshness after the hub's own writes (sysop #372).
+
+    ``_get_client`` stamps chroma.sqlite3's inode and mtime when it builds a
+    client, and treats any later change as a peer process's write (#2002): it
+    drops chromadb's shared cache and builds a new client, which reloads the
+    whole HNSW index on the next add or query. Opening a collection and every
+    write through it move that mtime too, so without a re-stamp the hub read
+    its own diary write as a peer's and reloaded the index for the next call
+    (about 7 s per diary write on a 2.6 GB index). ``ChromaBackend._restamp``
+    fixed the same thing for the backend's cache; this is the hub's twin.
+
+    Passed as ``backend=`` to the hub's ``ChromaCollection`` so its write lock
+    calls ``_restamp`` once the write is done, still under the palace lock.
+    It re-stamps only while this process holds the palace lock, so no
+    cooperating peer can have committed in between (#372 review A1). Without
+    the lock it leaves the stamp alone, and the next call rebuilds as before.
+    """
+
+    @staticmethod
+    def _restamp(palace_path):
+        global _palace_db_inode, _palace_db_mtime, _palace_db_identity
+        if _client_cache is None or palace_path != _config.palace_path:
+            return
+        if not palace_lock_held_here(palace_path):
+            return
+        try:
+            st = os.stat(os.path.join(palace_path, "chroma.sqlite3"))
+        except OSError:
+            return
+        _palace_db_inode = st.st_ino
+        _palace_db_mtime = st.st_mtime
+        _palace_db_identity = _db_identity(palace_path)
+        note_own_db_state(palace_path, _client_cache)
 
 
 def _get_collection(create=False):
@@ -258,7 +340,11 @@ def _get_collection(create=False):
                         **ef_kwargs,
                     )
                 _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _collection_cache = ChromaCollection(
+                    raw, palace_path=_config.palace_path, backend=_SessionStamp
+                )
+                # The open itself wrote chroma.sqlite3 (sysop #372).
+                _SessionStamp._restamp(_config.palace_path)
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
@@ -268,7 +354,11 @@ def _get_collection(create=False):
                 ef_kwargs = {"embedding_function": ef} if ef is not None else {}
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
                 _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _collection_cache = ChromaCollection(
+                    raw, palace_path=_config.palace_path, backend=_SessionStamp
+                )
+                # The open itself wrote chroma.sqlite3 (sysop #372).
+                _SessionStamp._restamp(_config.palace_path)
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
