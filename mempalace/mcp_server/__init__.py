@@ -94,7 +94,10 @@ from ..backends.chroma import (  # noqa: E402
     ChromaCollection,
     _HNSW_WRITE_DEFAULTS,
     _pin_hnsw_threads,
+    changed_by_own_engine,
+    current_own_engine,
     hnsw_capacity_status,
+    note_own_db_state,
     reset_hnsw_capacity_cache,
 )
 from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402

@@ -2213,6 +2213,70 @@ def _as_list(v: Any) -> list:
     return [v]
 
 
+
+# sysop #372: the palace file as this process itself last left it.
+#
+# The hub holds two client caches for one palace: ``mcp_server._get_client`` and
+# ``ChromaBackend._client``. Each re-stamps after its own writes, but each read the
+# other's write as a peer process's: it cleared chromadb's shared cache and built a
+# new engine, which reloads the whole HNSW index (about 7 s per diary write on a
+# 2.6 GB index). This record lets either cache tell "this process wrote that, with
+# the engine I hold" from a real outside change (#2002), which still rebuilds.
+_OWN_DB_STATE: dict = {}
+
+
+def _db_identity(palace_path: str):
+    """chroma.sqlite3's inode, mtime in ns, size and SQLite file change counter.
+
+    The counter (header bytes 24-27) goes up on every commit by any connection in
+    rollback-journal mode, so a peer's commit cannot leave the identity unchanged
+    even inside the file system's mtime granularity. None when unreadable.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    try:
+        with open(db_path, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            fh.seek(24)
+            counter = fh.read(4)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size, counter)
+
+
+def _engine_of(client):
+    """The chromadb engine (server object) behind a client; shared clients share it."""
+    return getattr(client, "_server", None) if client is not None else None
+
+
+def note_own_db_state(palace_path: str, client) -> None:
+    """Record chroma.sqlite3 as this process's ``client`` just left it (sysop #372).
+
+    Call only right after this process's own write or collection open on it."""
+    engine = _engine_of(client)
+    identity = _db_identity(palace_path)
+    if engine is None or identity is None:
+        return
+    _OWN_DB_STATE[palace_path] = (engine, identity)
+
+
+def changed_by_own_engine(palace_path: str, client) -> bool:
+    """True when chroma.sqlite3 is exactly as ``client``'s own engine, in this
+    process, last left it: the change a freshness stamp saw is ours, not a peer's."""
+    engine = _engine_of(client)
+    record = _OWN_DB_STATE.get(palace_path)
+    if engine is None or record is None or record[0] is not engine:
+        return False
+    return record[1] == _db_identity(palace_path)
+
+
+def current_own_engine(palace_path: str):
+    """The engine this process last wrote chroma.sqlite3 through, when the file is
+    still exactly as it left it; else None (sysop #372)."""
+    record = _OWN_DB_STATE.get(palace_path)
+    if record is None or record[1] != _db_identity(palace_path):
+        return None
+    return record[0]
+
 def _close_client(client) -> None:
     """Call ``PersistentClient.close()`` if available, swallow otherwise.
 
@@ -3060,6 +3124,15 @@ class ChromaBackend(BaseBackend):
             and abs(current_mtime - cached_mtime) > 0.01
         )
 
+        if (
+            cached is not None
+            and (inode_changed or mtime_changed)
+            and changed_by_own_engine(palace_path, cached)
+        ):
+            # This process wrote it, through the engine we hold (sysop #372).
+            self._freshness[palace_path] = (current_inode, current_mtime)
+            return cached
+
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
             # Drop the per-process quarantine gate so the HNSW pre-checks
             # run again against the new disk state. An inode swap means a
@@ -3126,6 +3199,7 @@ class ChromaBackend(BaseBackend):
         """
         if palace_path in self._freshness:
             self._freshness[palace_path] = self._db_stat(palace_path)
+            note_own_db_state(palace_path, self._clients.get(palace_path))
 
     # ------------------------------------------------------------------
     # Public static helpers (legacy; prefer :meth:`get_collection`)

@@ -412,3 +412,152 @@ class TestDiaryTools:
 
 
 # ── Cache Invalidation (inode/mtime) ──────────────────────────────────
+
+
+# ── sysop #372: the hub's own writes must not look like a peer's ─────────
+
+
+def _count_client_builds(monkeypatch):
+    from mempalace import mcp_server
+
+    builds = []
+    real = mcp_server.ChromaBackend.make_client
+
+    def counting(path):
+        builds.append(path)
+        return real(path)
+
+    monkeypatch.setattr(mcp_server.ChromaBackend, "make_client", staticmethod(counting))
+    return builds
+
+
+def test_hub_writes_and_reads_reuse_one_client(monkeypatch, config, palace_path, kg):
+    """sysop #372: every diary write on the live hub rebuilt the client.
+
+    ``_get_client`` stamps chroma.sqlite3's mtime only when it builds a client,
+    and the collection it hands out could not re-stamp after its own writes. So
+    the hub's own diary write moved the mtime, the next call read that as a peer
+    process's write, dropped chromadb's cache and reloaded the whole HNSW index
+    (2.6 GB on the live palace, about 7 s per diary write).
+    """
+    import time
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+    from mempalace import mcp_server
+
+    builds = _count_client_builds(monkeypatch)
+
+    def write(n):
+        time.sleep(0.05)  # past the 0.01 s mtime tolerance
+        out = mcp_server.tool_diary_write(agent_name="hub", entry=f"checkpoint {n}", topic="checkpoint")
+        assert out["success"] is True
+
+    write(1)
+    assert len(builds) == 1
+    write(2)
+    write(3)
+    time.sleep(0.05)
+    assert mcp_server.tool_diary_read(agent_name="hub")["entries"]
+    write(4)
+    time.sleep(0.05)
+    mcp_server.tool_search(query="checkpoint", limit=3)
+    write(5)
+    assert len(builds) == 1, f"the hub rebuilt its client {len(builds) - 1} times for its own writes"
+
+
+def test_a_peer_write_still_rebuilds_the_hub_client(monkeypatch, config, palace_path, kg):
+    """The re-stamp covers only the hub's own writes: a change it did not make
+    (here, the file's mtime moved by hand) still rebuilds the client (#2002)."""
+    import os
+    import time
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+    from mempalace import mcp_server
+
+    builds = _count_client_builds(monkeypatch)
+    assert mcp_server.tool_diary_write(agent_name="hub", entry="one", topic="checkpoint")["success"]
+    assert len(builds) == 1
+    db = os.path.join(palace_path, "chroma.sqlite3")
+    later = os.stat(db).st_mtime + 5
+    os.utime(db, (later, later))
+    time.sleep(0.05)
+    assert mcp_server.tool_diary_write(agent_name="hub", entry="two", topic="checkpoint")["success"]
+    assert len(builds) == 2
+
+
+def test_hub_diary_writes_mines_and_searches_share_one_engine(monkeypatch, config, palace_path, kg, tmp_path):
+    """sysop #372: on the live hub a diary write follows mines and searches from
+    other sessions. Those go through ``ChromaBackend``'s own client cache, and
+    each cache read the other's write as a peer process's: it cleared chromadb's
+    shared cache and built a new engine, which reloads the HNSW index. Within one
+    process the calls must share one engine, plus at most one new engine per
+    post-mine check, which clears the cache on purpose.
+    """
+    import json
+    import time
+
+    import chromadb
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+    from mempalace import mcp_server
+
+    engines = []
+    real = chromadb.PersistentClient
+
+    def recording(*args, **kwargs):
+        client = real(*args, **kwargs)
+        engines.append(client._server)
+        return client
+
+    monkeypatch.setattr(chromadb, "PersistentClient", recording)
+    # The full post-mine check clears chromadb's cache on purpose, so it may cost
+    # one new engine each time it runs. Bookmark saves (the hooks' saves) run it
+    # at most once per MEMPALACE_FASTPATH_POSTMINE_SECS.
+    from mempalace import convo_miner
+
+    checks = []
+    real_check = convo_miner._validate_palace_fts5_after_mine
+
+    def counted_check(path):
+        checks.append(path)
+        return real_check(path)
+
+    monkeypatch.setattr(convo_miner, "_validate_palace_fts5_after_mine", counted_check)
+    chat = tmp_path / "chat.jsonl"
+
+    def add_chat(n):
+        with open(chat, "a", encoding="utf-8") as fh:
+            for i in range(n, n + 3):
+                fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": f"question {i} about the hub and its palace"}}) + "\n")
+                fh.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": f"answer {i}: the hub files the diary"}]}}) + "\n")
+
+    def write(n):
+        time.sleep(0.05)
+        assert mcp_server.tool_diary_write(agent_name="hub", entry=f"checkpoint {n}", topic="checkpoint")["success"]
+
+    write(1)
+    add_chat(0)
+    time.sleep(0.05)
+    assert mcp_server.tool_mine(source=str(chat), mode="convos", wing="wing_hub")["success"]
+    write(2)
+    time.sleep(0.05)
+    mcp_server.tool_search(query="hub", limit=3)
+    write(3)
+    add_chat(10)
+    time.sleep(0.05)
+    assert mcp_server.tool_mine(source=str(chat), mode="convos", wing="wing_hub")["success"]
+    time.sleep(0.05)
+    mcp_server.tool_search(query="diary", limit=3)
+    write(4)
+    distinct = {id(e) for e in engines}
+    assert checks, "the first mine should have run the post-mine check"
+    assert len(distinct) <= 1 + len(checks), (
+        f"{len(distinct)} engines built for {len(checks)} post-mine checks; "
+        "each extra one reloads the whole index"
+    )
