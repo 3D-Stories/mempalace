@@ -2226,21 +2226,18 @@ _OWN_DB_STATE: dict = {}
 
 
 def _db_identity(palace_path: str):
-    """chroma.sqlite3's inode, mtime in ns, size and SQLite file change counter.
+    """chroma.sqlite3's device, inode, size, and mtime and ctime in ns. None when unreadable.
 
-    The counter (header bytes 24-27) goes up on every commit by any connection in
-    rollback-journal mode, so a peer's commit cannot leave the identity unchanged
-    even inside the file system's mtime granularity. None when unreadable.
+    ``os.stat`` only. Opening and closing a descriptor on the file would drop the
+    POSIX locks chromadb's own SQLite holds on it in this process (see
+    ``_magic``). Compared exactly, these catch any commit that lands in a later
+    file-timestamp tick or changes the size.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
     try:
-        with open(db_path, "rb") as fh:
-            st = os.fstat(fh.fileno())
-            fh.seek(24)
-            counter = fh.read(4)
+        st = os.stat(os.path.join(palace_path, "chroma.sqlite3"))
     except OSError:
         return None
-    return (st.st_ino, st.st_mtime_ns, st.st_size, counter)
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def _engine_of(client):

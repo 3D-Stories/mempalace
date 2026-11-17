@@ -59,7 +59,7 @@ def _get_client():
         and _db_identity(_config.palace_path) != _palace_db_identity
     ):
         # A commit inside the mtime tolerance after our own re-stamp: only the
-        # file's change counter shows it, and it is not ours (#372 review A2).
+        # exact identity shows it, and it is not ours (#372 review A2).
         mtime_changed = True
 
     if (
