@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -1000,6 +1001,275 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
     return messages[-count:]
 
 
+# ── Incremental transcript scan for the Stop hook ────────────────────────
+#
+# ``hook_stop`` needs two things from the transcript: the exchange count
+# (:func:`_count_human_messages`) and the recent messages
+# (:func:`_extract_recent_messages`). Each of those parses the whole file, a
+# transcript reaches gigabytes, and the hook is killed 30 s after it starts
+# (``"timeout": 30`` in ``.claude-plugin/hooks/hooks.json``). The scan below
+# reads only the bytes appended since the last Stop and returns the same two
+# answers in one pass. The two functions above are left alone: they are the
+# reference the scan is tested against, and its fallback.
+
+#: Seconds one Stop may spend scanning. The first scan of a multi-gigabyte
+#: transcript does not fit in one hook run; when the box runs out the scan
+#: saves how far it got and the next Stop carries on from there, so it is
+#: never killed half-way with nothing kept.
+_SCAN_TIME_BOX_S = 10.0
+#: Leading bytes hashed to recognise the file a saved offset belongs to.
+_SCAN_FINGERPRINT_BYTES = 4096
+_SCAN_STATE_VERSION = 1
+
+
+@dataclass
+class _TranscriptScan:
+    """What the Stop hook reads from a transcript.
+
+    ``count`` and ``recent`` equal ``_count_human_messages`` and
+    ``_extract_recent_messages`` for the same bytes when ``complete`` is true.
+    When it is false the time box ran out first: the numbers are partial and
+    must not be acted on. ``offset`` of ``size`` bytes are consumed.
+    """
+
+    count: int
+    recent: list
+    complete: bool = True
+    offset: int = 0
+    size: int = 0
+
+
+def _scan_state_path(path: Path) -> Path:
+    """Where the scan keeps its place for one transcript, keyed by resolved path.
+
+    Keyed by path and not by session id, so a resumed session finds the
+    offset its earlier Stops reached instead of rescanning the whole file.
+    """
+    digest = hashlib.sha256(os.fsencode(str(path))).hexdigest()[:24]
+    return STATE_DIR / f"scan_{digest}.json"
+
+
+def _load_scan_state(state_file: Path) -> Optional[dict]:
+    """The saved scan state, or None when there is none or it cannot be trusted.
+
+    A missing, torn or wrong-shaped file is not an error: the scan starts
+    again at byte zero and writes a good one. Any other ``OSError`` is raised,
+    which sends :func:`_scan_transcript` to the full parse.
+    """
+    try:
+        with open(state_file, encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return None
+    except ValueError:  # bad JSON, or bytes that are not UTF-8
+        return None
+    if not isinstance(state, dict) or state.get("v") != _SCAN_STATE_VERSION:
+        return None
+    offset, count, recent = state.get("offset"), state.get("count"), state.get("recent")
+    trusted = (
+        type(offset) is int
+        and offset >= 0
+        and type(count) is int
+        and count >= 0
+        and isinstance(recent, list)
+        and len(recent) <= _RECENT_MSG_COUNT
+        and all(isinstance(message, str) for message in recent)
+        and isinstance(state.get("fp"), str)
+        and state.get("fp_len") == min(offset, _SCAN_FINGERPRINT_BYTES)
+    )
+    return state if trusted else None
+
+
+def _save_scan_state(state_file: Path, state: dict) -> None:
+    """Write the scan state whole or not at all: a temp file, then a rename."""
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=state_file.name + ".", suffix=".tmp", dir=str(state_file.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp_name, state_file)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _scan_line(line: str) -> tuple:
+    """What one transcript line adds: ``(exchanges, recent message or None)``.
+
+    The two halves repeat the loop bodies of :func:`_count_human_messages` and
+    :func:`_extract_recent_messages` rule for rule, and
+    ``tests/test_stop_hook_incremental.py`` holds the three equal. A rule
+    changed there must be changed here.
+    """
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        return 0, None
+
+    counted = 0
+    try:
+        msg = entry.get("message", {})
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "")
+            is_command = False
+            if isinstance(content, str):
+                is_command = "<command-message>" in content
+            elif isinstance(content, list):
+                text = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+                is_command = "<command-message>" in text
+            if not is_command:
+                counted = 1
+        elif entry.get("type") == "event_msg":
+            payload = entry.get("payload", {})
+            if isinstance(payload, dict) and payload.get("type") == "user_message":
+                msg_text = payload.get("message", "")
+                if isinstance(msg_text, str) and "<command-message>" not in msg_text:
+                    counted = 1
+    except AttributeError:
+        pass
+
+    recent = None
+    try:
+        msg = entry.get("message") or entry.get("event_message") or {}
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+            if isinstance(content, str) and content.strip():
+                if not _is_harness_boilerplate(content):
+                    recent = content.strip()[:200]
+        elif entry.get("type") == "event_msg":
+            payload = entry.get("payload", {})
+            if isinstance(payload, dict) and payload.get("type") == "user_message":
+                text = payload.get("message", "")
+                if isinstance(text, str) and text.strip():
+                    if not _is_harness_boilerplate(text):
+                        recent = text.strip()[:200]
+    except AttributeError:
+        pass
+    return counted, recent
+
+
+def _scan_transcript_incremental(path: Path) -> _TranscriptScan:
+    """Read the bytes appended since the last Stop. See :func:`_scan_transcript`."""
+    deadline = time.monotonic() + _SCAN_TIME_BOX_S
+    state_file = _scan_state_path(path)
+    saved = _load_scan_state(state_file)
+    offset, count, recent = 0, 0, []
+    resumed = False
+    complete = True
+    tail = b""
+    with open(path, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        # Carry on from the saved offset only when this is still the file it
+        # was taken from: not shorter, the same leading bytes, and the offset
+        # still sitting just after a newline. Otherwise start again at zero.
+        # A file swapped for one with the same first bytes whose lines happen
+        # to break at the same offset is not noticed. A Claude Code transcript
+        # opens with its own session id, so that takes a deliberate copy.
+        if saved is not None and saved["offset"] <= size:
+            head = f.read(saved["fp_len"])
+            f.seek(max(saved["offset"] - 1, 0))
+            at_line_start = saved["offset"] == 0 or f.read(1) == b"\n"
+            if at_line_start and hashlib.sha256(head).hexdigest() == saved["fp"]:
+                offset, count, recent = saved["offset"], saved["count"], list(saved["recent"])
+                resumed = True
+        f.seek(offset)
+        # Lines end at the newline byte and are decoded as UTF-8 with
+        # errors="replace", which is what the reference functions' text-mode
+        # read gives for a real transcript: every JSONL writer ends a line with
+        # "\n", and "\r\n" parses the same because JSON ignores the trailing
+        # "\r". Only a lone "\r" differs: text mode breaks the line there, this
+        # read does not, so two records joined by a bare carriage return count
+        # as two there and as one unparsable line (nothing) here.
+        for raw in f:
+            if not raw.endswith(b"\n"):
+                tail = raw  # the last line has no newline yet: not consumed
+                break
+            offset += len(raw)
+            added, message = _scan_line(raw.decode("utf-8", errors="replace"))
+            count += added
+            if message is not None:
+                recent.append(message)
+                del recent[:-_RECENT_MSG_COUNT]
+            # Checked after a line, never before the first: every Stop moves on.
+            if time.monotonic() >= deadline:
+                complete = offset >= size
+                break
+        fp_len = min(offset, _SCAN_FINGERPRINT_BYTES)
+        if resumed and saved["fp_len"] == fp_len:
+            fingerprint = saved["fp"]
+        else:
+            f.seek(0)
+            fingerprint = hashlib.sha256(f.read(fp_len)).hexdigest()
+
+    state = {
+        "v": _SCAN_STATE_VERSION,
+        "path": str(path),
+        "offset": offset,
+        "count": count,
+        "recent": recent,
+        "fp": fingerprint,
+        "fp_len": fp_len,
+    }
+    if state != saved:
+        try:
+            _save_scan_state(state_file, state)
+        except OSError as exc:
+            if not complete:
+                # Progress that cannot be kept would be redone on every Stop
+                # and never finish. The full parse is what the hook did before.
+                raise
+            _log(f"Transcript scan state not saved ({exc}); the next Stop reads the file again")
+
+    if complete and tail:
+        # The full parse counts a last line with no newline when it is valid
+        # JSON, so the answer includes it. The saved state does not: the line
+        # may still be growing, and the next Stop reads it again from `offset`.
+        added, message = _scan_line(tail.decode("utf-8", errors="replace"))
+        count += added
+        if message is not None:
+            recent = (recent + [message])[-_RECENT_MSG_COUNT:]
+    return _TranscriptScan(count, recent, complete, offset, size)
+
+
+def _scan_transcript(transcript_path: str) -> _TranscriptScan:
+    """Exchange count and recent messages for the Stop hook, from new bytes only.
+
+    One pass over what the transcript gained since the last Stop gives both
+    answers: ``count`` equals :func:`_count_human_messages` and ``recent``
+    equals :func:`_extract_recent_messages`. The place reached is kept per
+    transcript in ``STATE_DIR``.
+
+    The pass is time-boxed (:data:`_SCAN_TIME_BOX_S`). A scan that runs out of
+    time returns ``complete=False`` after saving its progress, and the caller
+    must not save on those partial numbers. A finished scan is exact.
+
+    Any error on this path falls back to the two full-parse functions, so the
+    worst case is what the hook did before.
+    """
+    path = _validate_transcript_path(transcript_path)
+    if path is None:
+        if transcript_path:
+            _log(f"WARNING: transcript_path rejected by validator: {transcript_path!r}")
+        return _TranscriptScan(0, [])
+    # A FIFO or a device node is never opened: the open would block the hook.
+    if not path.is_file():
+        return _TranscriptScan(0, [])
+    try:
+        return _scan_transcript_incremental(path)
+    except Exception as exc:
+        _log(f"Incremental transcript scan failed ({exc!r}); falling back to a full parse")
+        return _TranscriptScan(
+            _count_human_messages(transcript_path), _extract_recent_messages(transcript_path)
+        )
+
+
 _THEME_STOPWORDS = frozenset(
     "the a an and or but in on at to for of is it i me my you your we our "
     "this that with from by was were be been are not no yes can do did dont "
@@ -1039,15 +1309,45 @@ def _extract_themes(messages: list[str], max_themes: int = 3) -> list[str]:
 _HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
 _HUB_HEALTH_TIMEOUT_S = 2.0
 _HUB_DIARY_TIMEOUT_S = 60.0
+#: A hub wait is never cut below this, so a late save still gets one real try.
+_HUB_DIARY_MIN_TIMEOUT_S = 1.0
+
+# Claude Code kills the Stop hook 30 s after it starts (``"timeout": 30`` in
+# ``.claude-plugin/hooks/hooks.json``). A killed hook never reaches its
+# ``_last_save`` marker, so the next Stop repeats the whole save and the hub
+# files the note again. A 60 s hub wait can never end inside a 30 s hook, so
+# the Stop hook cuts the wait to what it has left. ``_STOP_HOOK_BUDGET_S`` is
+# the part of the 30 s that ``hook_stop`` plans with; the rest covers the shell
+# wrapper and interpreter start-up, which run before its clock starts.
+# ``_STOP_HOOK_RESERVE_S`` is held back for what follows the hub call: the
+# ingest dispatch, the marker write and the hook's output.
+_STOP_HOOK_BUDGET_S = 25.0
+_STOP_HOOK_RESERVE_S = 3.0
 
 
-def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
+def _stop_hook_hub_timeout(hook_started: float) -> float:
+    """Seconds the Stop hook can still give the hub's diary write.
+
+    ``hook_started`` is the ``time.monotonic()`` reading taken when
+    ``hook_stop`` began.
+    """
+    remaining = _STOP_HOOK_BUDGET_S - (time.monotonic() - hook_started) - _STOP_HOOK_RESERVE_S
+    return max(_HUB_DIARY_MIN_TIMEOUT_S, min(_HUB_DIARY_TIMEOUT_S, remaining))
+
+
+def _forward_diary_to_hub(
+    agent_name: str, entry: str, topic: str, wing: str, timeout: Optional[float] = None
+):
     """File one diary checkpoint inside the palace hub, if a live one serves us.
 
     Returns True when the hub filed it, False when there is no usable hub
     (the caller then writes in-process, as before), and None when the hub
     answered but the write failed — the entry may already be filed, so the
     caller must not retry locally.
+
+    ``timeout`` bounds the whole exchange, health probe included, for a caller
+    with a deadline of its own (the Stop hook). Without it the probe and the
+    write keep their fixed waits.
     """
     import urllib.error
     import urllib.request
@@ -1056,6 +1356,7 @@ def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
 
     if os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}:
         return False
+    started = time.monotonic()
     try:
         palace_path = MempalaceConfig().palace_path
         info = server_registry.read_live_serverinfo(palace_path)
@@ -1072,7 +1373,10 @@ def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
 
     try:
         health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
-        with urllib.request.urlopen(health, timeout=_HUB_HEALTH_TIMEOUT_S) as resp:
+        health_timeout = _HUB_HEALTH_TIMEOUT_S
+        if timeout is not None:
+            health_timeout = min(health_timeout, timeout)
+        with urllib.request.urlopen(health, timeout=health_timeout) as resp:
             if resp.status != 200:
                 return False
     except (urllib.error.URLError, OSError, ValueError):
@@ -1096,9 +1400,13 @@ def _forward_diary_to_hub(agent_name: str, entry: str, topic: str, wing: str):
         ensure_ascii=False,
     ).encode("utf-8")
 
+    write_timeout = _HUB_DIARY_TIMEOUT_S
+    if timeout is not None:
+        # What the discovery and the health probe used comes out of the same allowance.
+        write_timeout = max(_HUB_DIARY_MIN_TIMEOUT_S, timeout - (time.monotonic() - started))
     try:
         request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
-        with urllib.request.urlopen(request, timeout=_HUB_DIARY_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(request, timeout=write_timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         _log(f"Hub rejected diary checkpoint ({exc.code} {exc.reason})")
@@ -1131,6 +1439,8 @@ def _save_diary_direct(
     toast: bool = False,
     *,
     agent_name: str,
+    recent_messages: Optional[list] = None,
+    hub_timeout: Optional[float] = None,
 ) -> dict:
     """Write a diary checkpoint by calling the tool function directly (no MCP roundtrip).
 
@@ -1144,8 +1454,17 @@ def _save_diary_direct(
     A daemon lock deferral also returns {"count": 0}: nothing is filed yet, but
     the entry is queued and the daemon files it once the holder exits, so the
     checkpoint marker is deliberately not advanced.
+
+    ``recent_messages`` hands over messages the caller already read from the
+    transcript (the Stop hook's incremental scan), so the file is not parsed a
+    second time; without it the transcript is parsed here, as before.
+    ``hub_timeout`` bounds the wait for a hub write for a caller with a
+    deadline; without it the hub wait keeps its default.
     """
-    messages = _extract_recent_messages(transcript_path)
+    if recent_messages is None:
+        messages = _extract_recent_messages(transcript_path)
+    else:
+        messages = recent_messages
     if not messages:
         _log("No recent messages to save")
         return {"count": 0}
@@ -1213,7 +1532,9 @@ def _save_diary_direct(
 
         # Prefer the hub: it owns the writer lease, so an in-process write
         # loses to it. No hub means no contention, and we write directly.
-        hub_status = _forward_diary_to_hub(agent_name, entry, "checkpoint", wing)
+        hub_status = _forward_diary_to_hub(
+            agent_name, entry, "checkpoint", wing, timeout=hub_timeout
+        )
         if hub_status is None:
             return {"count": 0}
         if hub_status:
@@ -1521,6 +1842,7 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
 
 def hook_stop(data: dict, harness: str):
     """Stop hook: block every N messages for auto-save."""
+    hook_started = time.monotonic()
     if not _palace_root_exists():
         _output({})
         return
@@ -1551,8 +1873,20 @@ def hook_stop(data: dict, harness: str):
             _output({})
             return
 
-    # Count human messages
-    exchange_count = _count_human_messages(transcript_path)
+    # Count human messages, reading only what the transcript gained since the
+    # last Stop. The same pass collects the recent messages a save needs.
+    scan = _scan_transcript(transcript_path)
+    if not scan.complete:
+        # The time box ran out part-way through a large transcript. The scan
+        # kept its place and the next Stop carries on; a save now would act on
+        # a partial count, so this Stop saves nothing and leaves the marker.
+        _log(
+            f"Session {session_id}: transcript scan unfinished "
+            f"({scan.offset} of {scan.size} bytes read); no save this Stop"
+        )
+        _output({})
+        return
+    exchange_count = scan.count
 
     # Track last save point
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1599,6 +1933,8 @@ def hook_stop(data: dict, harness: str):
                         wing=project_wing,
                         toast=toast,
                         agent_name=_diary_agent_for_harness(harness),
+                        recent_messages=scan.recent,
+                        hub_timeout=_stop_hook_hub_timeout(hook_started),
                     )
                     ingest_dispatched = _ingest_transcript(transcript_path)
                 _maybe_auto_ingest()
